@@ -1,0 +1,166 @@
+#69
+import os
+import re
+import tempfile
+from datetime import datetime
+from typing import Dict, Any, List
+
+import requests
+import gradio as gr
+
+# =============================
+# 설정: Ollama 로컬 서버
+# =============================
+# 기본적으로 Ollama는 localhost:11434 에서 동작합니다.
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:latest")  # 예: deepseek-r1:7b, deepseek-r1:32b 등
+
+# =============================
+# 유틸: Ollama Chat 호출
+# =============================
+
+def _strip_think(text: str) -> str:
+    """DeepSeek-R1의 <think>...</think> 내부 사고 과정을 감춥니다 (UI 노이즈 제거)."""
+    return re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
+
+
+def ollama_chat(messages: List[Dict[str, str]], model: str, **options) -> str:
+    """
+    Ollama Chat API로 로컬 LLM(DeepSeek-R1 등)을 호출합니다.
+    - messages: [{"role": "system|user|assistant", "content": "..."}, ...]
+    - options 예: temperature=0.7, num_predict=512, top_p=0.9
+    반환: 모델의 텍스트 응답(str)
+    """
+    url = f"{OLLAMA_URL}/api/chat"
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": options or {},
+    }
+    resp = requests.post(url, json=payload, timeout=600)
+    resp.raise_for_status()
+    data = resp.json()
+    content = data.get("message", {}).get("content", "")
+    return _strip_think(content)
+
+# =============================
+# 프롬프트 템플릿
+# =============================
+
+SYSTEM_PROMPT = (
+    "You are an award-winning Korean writer. \n"
+    "Write vivid, engaging literature in natural Korean. \n"
+    "Balance elegance and clarity; avoid purple prose. \n"
+    "Respect the user's requested form and constraints."
+)
+
+NOVEL_INSTRUCTIONS = (
+    "아래 주제로 짧은 소설을 작성하세요.\n"
+    "필수 요구사항:\n"
+    "- 분량: 약 {length}자 내외 (너무 길면 요약적 전개)\n"
+    "- 시점/인물/배경을 명확히 제시\n"
+    "- 대사와 묘사를 적절히 혼합\n"
+    "- 클리셰 남발 금지, 깔끔한 결말\n"
+)
+
+POEM_INSTRUCTIONS = (
+    "아래 주제로 현대시를 작성하세요.\n"
+    "필수 요구사항:\n"
+    "- 분량: 약 {length}자 내외\n"
+    "- 사족/수사는 절제, 이미지 중심\n"
+    "- 불필요한 과장 금지\n"
+    "- 리듬과 여운을 고려\n"
+)
+
+# =============================
+# 생성 함수 (Gradio 이벤트 핸들러)
+# =============================
+
+def generate_text(topic: str, kind: str, temperature: float, max_tokens: int, length_hint: int, model_name: str):
+    if not topic or not topic.strip():
+        return "주제를 입력하세요.", None
+
+    if kind not in ("소설", "시"):
+        return "형식 선택이 올바르지 않습니다.", None
+
+    instructions = NOVEL_INSTRUCTIONS if kind == "소설" else POEM_INSTRUCTIONS
+    user_prompt = (
+        f"형식: {kind}\n"
+        f"주제: {topic.strip()}\n\n"
+        + instructions.format(length=length_hint)
+    )
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    try:
+        text = ollama_chat(
+            messages,
+            model=model_name or OLLAMA_MODEL,
+            temperature=float(temperature),
+            num_predict=int(max_tokens),  # Ollama의 출력 토큰 제한 옵션
+            top_p=0.9,
+        )
+    except Exception as e:
+        return f"모델 호출 중 오류가 발생했습니다: {e}", None
+
+    # 다운로드 파일 생성 (임시 파일)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = f"{('novel' if kind=='소설' else 'poem')}_{ts}.txt"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+    tmp.write(text.encode("utf-8"))
+    tmp.flush()
+    tmp.close()
+
+    return text, tmp.name
+
+# =============================
+# Gradio UI 구성
+# =============================
+
+def build_ui():
+    with gr.Blocks(theme=gr.themes.Soft()) as demo:
+        gr.Markdown("""
+        # ✍️ Langchain API Client → **Ollama 로컬 LLM 클라이언트 (Gradio)**
+        - **폐쇄형 API 무관**: 로컬 **Ollama + DeepSeek-R1** 만으로 동작합니다.
+        - **형식 선택**: 소설 / 시
+        - **다운로드**: 결과 텍스트 파일 저장
+        """)
+
+        with gr.Row():
+            topic = gr.Textbox(label="주제를 입력하세요", placeholder="예) 첫눈 오는 날의 약속", lines=2)
+        with gr.Row():
+            kind = gr.Radio(["소설", "시"], value="소설", label="작품 형식")
+        with gr.Row():
+            with gr.Column():
+                temperature = gr.Slider(0.0, 1.5, value=0.7, step=0.05, label="창의성(temperature)")
+            with gr.Column():
+                max_tokens = gr.Slider(64, 2048, value=512, step=32, label="출력 토큰 한도(num_predict)")
+            with gr.Column():
+                length_hint = gr.Slider(100, 1500, value=600, step=50, label="분량 힌트(문자 수)")
+        with gr.Row():
+            model_name = gr.Textbox(label="모델 이름(옵션)", value=OLLAMA_MODEL, placeholder="예) deepseek-r1:latest")
+        with gr.Row():
+            run_btn = gr.Button("작성 요청 보내기", variant="primary")
+        with gr.Row():
+            output = gr.Markdown(label="출력")
+        with gr.Row():
+            file_out = gr.File(label="결과 다운로드", interactive=False)
+
+        run_btn.click(
+            fn=generate_text,
+            inputs=[topic, kind, temperature, max_tokens, length_hint, model_name],
+            outputs=[output, file_out],
+        )
+
+    return demo
+
+
+if __name__ == "__main__":
+    app = build_ui()
+    # 외부에서 접속 필요 시 share=True 사용 가능
+    app.launch(server_name="0.0.0.0", server_port=7861, share=False)
+

@@ -1,0 +1,188 @@
+#61
+"""
+FAISS 질의 예제 (OpenAIEmbeddings → OllamaEmbeddings 전환)
+- 로컬 Ollama 임베딩 모델 사용 (예: nomic-embed-text)
+- 기존에 생성해 둔 FAISS 인덱스(restaurant-faiss) 로드 후 검색
+- Gradio GUI 제공 (검색 & 선택적으로 DeepSeek-R1로 답변 생성)
+
+사전 준비
+1) Ollama 설치 후 필요한 모델들 받기:
+   - 임베딩:   `ollama pull nomic-embed-text`
+   - 생성형(선택): `ollama pull deepseek-r1:latest`
+2) 레포/폴더에 restaurants.txt로부터 벡터 인덱스를 먼저 만들어 두세요
+   (이전 단계에서 만든 restaurant-faiss 폴더를 재사용)
+
+주의
+- OpenAI API Key 불필요. .env도 사용하지 않습니다.
+- Windows 경로 문제시 TextLoader 경로를 "\\"로 교체하세요.
+"""
+
+from __future__ import annotations
+import os
+import asyncio
+from typing import List
+
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain.schema.document import Document
+
+import gradio as gr
+
+# -----------------------------
+# 경로 설정
+# -----------------------------
+current_dir = os.path.dirname(os.path.abspath(__file__))
+faiss_dir = os.path.join(current_dir, "restaurant-faiss")
+
+# -----------------------------
+# 임베딩 모델 준비 (Ollama)
+# -----------------------------
+# nomic-embed-text는 텍스트 임베딩용 경량 모델입니다.
+# 필요시 bge-m3 등으로 교체 가능합니다: model="bge-m3"
+embeddings = OllamaEmbeddings(model="nomic-embed-text")
+
+# -----------------------------
+# 벡터 DB 로드 헬퍼
+# -----------------------------
+
+def load_faiss_or_raise() -> FAISS:
+    if not os.path.isdir(faiss_dir):
+        raise FileNotFoundError(
+            f"FAISS 인덱스 폴더가 없습니다: {faiss_dir}\n"
+            "먼저 인덱스를 생성하세요 (예: 이전 단계의 빌드 스크립트)."
+        )
+    # allow_dangerous_deserialization=True 는 신뢰된 로컬에서만 사용하세요.
+    return FAISS.load_local(faiss_dir, embeddings, allow_dangerous_deserialization=True)
+
+
+# -----------------------------
+# 콘솔 실행용 async main (원 코드 호환)
+# -----------------------------
+async def main() -> None:
+    db = load_faiss_or_raise()
+
+    # 검색할 쿼리 예시 (원 코드와 동일)
+    query = "음식점의 룸 서비스는 어떻게 운영되나요?"
+
+    # 1) 텍스트 기반 유사 검색 (상위 2개)
+    results: List[Document] = db.similarity_search(query, k=2)
+    print("[similarity_search 결과]\n")
+    for i, doc in enumerate(results, 1):
+        print(f"[{i}]", doc.page_content[:300].replace("\n", " ") + ("..." if len(doc.page_content) > 300 else ""))
+    print()
+
+    # 2) 쿼리를 벡터로 변환하여 검색
+    embedding_vector_query = embeddings.embed_query(query)
+    print("[임베딩 벡터 길이]:", len(embedding_vector_query), "\n")
+
+    # 비동기 벡터 검색 (버전별 메서드 명 상이 가능 → 예외 시 동기 메서드로 폴백)
+    try:
+        docs: List[Document] = await db.asimilarity_search_by_vector(embedding_vector_query, k=2)
+    except AttributeError:
+        # 일부 버전은 asimilarity_search_by_vector 미제공 → 동기 메서드로 대체
+        docs = db.similarity_search_by_vector(embedding_vector_query, k=2)
+
+    print("[벡터 기반 검색 첫 결과]\n")
+    if docs:
+        print(docs[0].page_content)
+    else:
+        print("검색 결과가 없습니다.")
+
+
+# -----------------------------
+# Gradio UI (검색 & 선택적 생성형 응답)
+# -----------------------------
+# 선택적으로 DeepSeek-R1을 사용해, 검색 결과를 바탕으로 짧은 답변을 생성합니다.
+# 로컬에서 `ollama pull deepseek-r1:latest` 후 사용하세요.
+try:
+    from langchain_community.llms import Ollama as OllamaLLM
+    _HAS_LLM = True
+except Exception:
+    _HAS_LLM = False
+
+
+def rag_answer(query: str, chunks: List[Document], model_name: str = "deepseek-r1:latest") -> str:
+    if not _HAS_LLM:
+        return "⚠️ DeepSeek-R1 LLM 모듈을 찾지 못했습니다. Ollama 설치 및 모델 pull 후 다시 시도하세요."
+    if not chunks:
+        return "관련 문서를 찾지 못했습니다. 질문을 바꿔보세요."
+
+    # 컨텍스트 구성 (상위 문서 일부만 사용)
+    context = "\n\n".join([f"[문서 {i+1}]\n" + d.page_content for i, d in enumerate(chunks[:3])])
+
+    prompt = (
+        "당신은 음식점 관련 문서로부터 답을 요약하는 조력자입니다. "
+        "아래 컨텍스트만 사용하여 한국어로 간결하게 답하세요.\n\n"
+        f"[컨텍스트]\n{context}\n\n"
+        f"[질문]\n{query}\n\n"
+        "[지침]\n- 출처를 나열하지 말고 문장으로 자연스럽게 답하세요.\n"
+        "- 확실하지 않은 내용은 추정하지 말고 '문서에 정보가 없습니다'라고 말하세요."
+    )
+
+    llm = OllamaLLM(model=model_name, temperature=0.2)
+    return llm.invoke(prompt)
+
+
+def ui_search(query: str, k: int, use_llm: bool, model_name: str) -> str:
+    try:
+        db = load_faiss_or_raise()
+    except Exception as e:
+        return f"❌ 인덱스 로드 실패: {e}"
+
+    if not query.strip():
+        return "질문을 입력하세요."
+
+    # 1) 검색
+    hits: List[Document] = db.similarity_search(query, k=k)
+
+    # 2) 결과 문자열 구성
+    result_lines = ["## 🔎 유사 문서 결과"]
+    if not hits:
+        result_lines.append("검색 결과가 없습니다.")
+    else:
+        for i, d in enumerate(hits, 1):
+            snippet = d.page_content.strip().replace("\n", " ")
+            if len(snippet) > 400:
+                snippet = snippet[:400] + "..."
+            result_lines.append(f"**{i}.** {snippet}")
+
+    # 3) 선택적으로 생성형 답변
+    if use_llm:
+        answer = rag_answer(query, hits, model_name=model_name or "deepseek-r1:latest")
+        result_lines.append("\n---\n## 🤖 DeepSeek-R1 요약 답변\n" + (answer or "(빈 응답)"))
+
+    return "\n\n".join(result_lines)
+
+
+# UI 구성
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("""
+    # 🍽️ 레스토랑 지식검색 (FAISS + Ollama)
+    로컬 임베딩(`nomic-embed-text`)으로 만든 **FAISS 인덱스**를 불러와 유사 문서를 찾습니다.  
+    선택적으로 **DeepSeek-R1**으로 요약 답변도 생성할 수 있어요.
+    """)
+
+    with gr.Row():
+        query_inp = gr.Textbox(label="질문", placeholder="예: 룸서비스 운영시간 알려줘", lines=2)
+    with gr.Row():
+        k_inp = gr.Slider(1, 10, value=3, step=1, label="가져올 문서 수 (k)")
+    with gr.Row():
+        use_llm_chk = gr.Checkbox(label="DeepSeek-R1로 요약 답변 생성", value=False)
+        model_inp = gr.Textbox(label="Ollama LLM 모델명", value="deepseek-r1:latest")
+    run_btn = gr.Button("검색 실행", variant="primary")
+
+    out_md = gr.Markdown()
+
+    run_btn.click(ui_search, inputs=[query_inp, k_inp, use_llm_chk, model_inp], outputs=out_md)
+
+
+if __name__ == "__main__":
+    # 콘솔 테스트: python 파일을 직접 실행했을 때 비동기 main도 수행
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print("[주의] 콘솔 테스트(main) 중 오류:", e)
+    
+    # Gradio 서버 실행
+    demo.launch(server_name="0.0.0.0", server_port=7860)
+

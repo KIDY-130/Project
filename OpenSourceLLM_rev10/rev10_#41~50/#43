@@ -1,0 +1,291 @@
+#43
+"""
+로컬 LLM (Ollama + DeepSeek-R1) + LlamaIndex + Gradio 통합 데모
+- 원본 노트북에서 OpenAI 의존 제거
+- Ollama 로컬 LLM/임베딩 사용 (API Key 불필요)
+- 폴더/웹/PDF 데이터 색인 및 질의, 색인 저장/불러오기 지원
+- Gradio UI 제공
+
+사전 준비
+1) Ollama 설치 & 실행 (기본: http://localhost:11434)
+2) 모델 다운로드:
+   - 언어모델:  ollama pull deepseek-r1
+   - 임베딩:    ollama pull nomic-embed-text
+3) 패키지 설치:
+   pip install "llama-index>=0.10.0" llama-index-llms-ollama llama-index-embeddings-ollama \
+               gradio requests pypdf beautifulsoup4
+
+데이터 예시
+- 'data' 폴더에 텍스트/마크다운/HTML/PDF 등 배치 가능
+- 'attention.pdf' 같은 PDF 파일은 현재 경로에 두면 됩니다.
+"""
+
+from __future__ import annotations
+import os
+from pathlib import Path
+from typing import Dict, Optional, List
+
+import gradio as gr
+
+# LlamaIndex 핵심 모듈
+from llama_index.core import (
+    VectorStoreIndex,
+    SimpleDirectoryReader,
+    StorageContext,
+    load_index_from_storage,
+    Settings,
+)
+
+# Ollama LLM/임베딩
+from llama_index.llms.ollama import Ollama
+from llama_index.embeddings.ollama import OllamaEmbedding
+
+# 웹 로더 (BeautifulSoup 기반)
+from llama_index.readers.web import BeautifulSoupWebReader
+
+
+# ---------------------------
+# 전역 설정: 로컬 LLM + 임베딩
+# ---------------------------
+DEFAULT_LLM_MODEL = "deepseek-r1"          # 언어모델
+DEFAULT_EMBED_MODEL = "nomic-embed-text"   # 임베딩 모델 (Ollama 지원)
+
+def configure_llamaindex(
+    llm_model: str = DEFAULT_LLM_MODEL,
+    embed_model: str = DEFAULT_EMBED_MODEL,
+    temperature: float = 0.2,
+    top_p: float = 0.95,
+):
+    """
+    LlamaIndex의 전역 Settings에 로컬 Ollama LLM/임베딩을 등록.
+    - OpenAI API 키/모듈 불필요
+    """
+    Settings.llm = Ollama(
+        model=llm_model,
+        request_timeout=120,
+        temperature=temperature,
+        top_p=top_p,
+    )
+    Settings.embed_model = OllamaEmbedding(model_name=embed_model)
+
+
+# ---------------------------
+# 공통 유틸: 색인 저장/불러오기
+# ---------------------------
+def build_index_from_documents(documents, persist_dir: str) -> VectorStoreIndex:
+    """
+    주어진 문서 리스트를 색인하고 persist_dir에 저장.
+    """
+    index = VectorStoreIndex.from_documents(documents)
+    index.storage_context.persist(persist_dir=persist_dir)
+    return index
+
+def load_index(persist_dir: str) -> VectorStoreIndex:
+    """
+    저장된 색인을 persist_dir에서 재로딩.
+    """
+    storage_context = StorageContext.from_defaults(persist_dir=persist_dir)
+    return load_index_from_storage(storage_context)
+
+
+# ---------------------------
+# 데이터 소스별 색인 함수
+# ---------------------------
+def index_local_folder(
+    folder_path: str,
+    persist_dir: str,
+) -> str:
+    """
+    로컬 폴더의 파일들로부터 색인을 생성하고 저장.
+    SimpleDirectoryReader가 txt/md/html/pdf 등 다양한 포맷을 자동 처리.
+    """
+    folder = Path(folder_path)
+    if not folder.exists() or not folder.is_dir():
+        return f"[오류] 폴더를 찾을 수 없습니다: {folder_path}"
+
+    documents = SimpleDirectoryReader(folder_path).load_data()
+    index = build_index_from_documents(documents, persist_dir)
+    # 저장 후 간단 검증 질의(Optional)
+    _ = index.as_query_engine()  # 엔진 생성만 수행
+    return f"[완료] 폴더 색인 생성 및 저장: {persist_dir} (문서 수: {len(documents)})"
+
+def index_web_urls(
+    urls_text: str,
+    persist_dir: str,
+) -> str:
+    """
+    줄바꿈/쉼표 구분으로 입력한 여러 URL을 수집하여 색인을 생성하고 저장.
+    """
+    urls: List[str] = []
+    for token in urls_text.replace(",", "\n").splitlines():
+        u = token.strip()
+        if u:
+            urls.append(u)
+    if not urls:
+        return "[오류] 유효한 URL이 없습니다."
+
+    loader = BeautifulSoupWebReader()
+    documents = loader.load_data(urls=urls)
+    index = build_index_from_documents(documents, persist_dir)
+    _ = index.as_query_engine()
+    return f"[완료] 웹 문서 색인 생성 및 저장: {persist_dir} (문서 수: {len(documents)})"
+
+def index_pdf_files(
+    file_paths_text: str,
+    persist_dir: str,
+) -> str:
+    """
+    줄바꿈/쉼표로 입력된 PDF 경로 목록을 읽어 색인 생성/저장.
+    (pypdf에 의존, SimpleDirectoryReader가 PDF를 처리)
+    """
+    paths: List[Path] = []
+    for token in file_paths_text.replace(",", "\n").splitlines():
+        p = Path(token.strip())
+        if p.exists() and p.is_file() and p.suffix.lower() == ".pdf":
+            paths.append(p)
+    if not paths:
+        return "[오류] 유효한 PDF 파일 경로가 없습니다."
+
+    # SimpleDirectoryReader는 디렉토리 입력이 기본이라, input_files로 직접 지정
+    documents = SimpleDirectoryReader(input_files=paths).load_data()
+    index = build_index_from_documents(documents, persist_dir)
+    _ = index.as_query_engine()
+    return f"[완료] PDF 색인 생성 및 저장: {persist_dir} (문서 수: {len(documents)})"
+
+
+# ---------------------------
+# 질의/응답 (저장된 색인 대상으로)
+# ---------------------------
+def query_index(
+    persist_dir: str,
+    user_query: str,
+    response_mode: str = "default",
+) -> str:
+    """
+    저장된 색인(persist_dir)을 로드하여 질의 수행.
+    response_mode는 LlamaIndex ResponseSynthesizer 모드 중 하나(기본값 'default').
+    """
+    if not user_query.strip():
+        return "[오류] 질의 내용을 입력하세요."
+
+    try:
+        index = load_index(persist_dir)
+    except Exception as e:
+        return f"[오류] 색인을 불러올 수 없습니다. 먼저 색인을 생성하세요.\n- persist_dir: {persist_dir}\n- 상세: {e}"
+
+    qe = index.as_query_engine(response_mode=response_mode)
+    res = qe.query(user_query)
+    return str(res)
+
+
+# ---------------------------
+# Gradio UI
+# ---------------------------
+with gr.Blocks(title="LlamaIndex + Ollama (DeepSeek-R1) RAG 데모") as demo:
+    gr.Markdown("## 🔎 LlamaIndex + Ollama (DeepSeek-R1) RAG 데모")
+    gr.Markdown(
+        "- **로컬 LLM/임베딩**으로 작동 (OpenAI 키 불필요)\n"
+        "- 폴더/웹/PDF 데이터를 색인하고 저장(persist), 이후 재사용 가능\n"
+        "- 한글/영문 질의 모두 가능 (예: *What did the author do growing up?* / *한국어로 답변해줘*)"
+    )
+
+    # 전역 모델 설정
+    with gr.Accordion("⚙️ 전역 모델 설정 (Ollama)", open=True):
+        with gr.Row():
+            llm_model = gr.Textbox(label="LLM 모델", value=DEFAULT_LLM_MODEL, scale=2)
+            embed_model = gr.Textbox(label="임베딩 모델", value=DEFAULT_EMBED_MODEL, scale=2)
+        with gr.Row():
+            temperature = gr.Slider(0.0, 1.5, value=0.2, step=0.05, label="temperature", scale=1)
+            top_p = gr.Slider(0.1, 1.0, value=0.95, step=0.05, label="top_p", scale=1)
+        apply_btn = gr.Button("모델 설정 적용", variant="primary")
+
+    # 색인 생성 탭들
+    with gr.Tabs():
+        with gr.Tab("📁 폴더 색인"):
+            with gr.Row():
+                folder_path = gr.Textbox(label="폴더 경로", value="data", scale=3)
+                persist_dir_folder = gr.Textbox(label="저장 경로(persist_dir)", value="storage_folder", scale=2)
+            build_folder_btn = gr.Button("폴더 색인 생성/저장", variant="primary")
+            folder_status = gr.Textbox(label="상태", lines=3)
+
+        with gr.Tab("🌐 웹 URL 색인"):
+            urls_text = gr.Textbox(
+                label="URL 목록 (쉼표/줄바꿈 구분)",
+                placeholder="예) https://www.law.go.kr/법령/대한민국헌법",
+                lines=3,
+            )
+            persist_dir_web = gr.Textbox(label="저장 경로(persist_dir)", value="storage_web")
+            build_web_btn = gr.Button("웹 색인 생성/저장", variant="primary")
+            web_status = gr.Textbox(label="상태", lines=3)
+
+        with gr.Tab("📄 PDF 색인"):
+            pdf_paths_text = gr.Textbox(
+                label="PDF 경로 목록 (쉼표/줄바꿈 구분)",
+                placeholder="예) ./attention.pdf",
+                lines=3,
+            )
+            persist_dir_pdf = gr.Textbox(label="저장 경로(persist_dir)", value="storage_pdf")
+            build_pdf_btn = gr.Button("PDF 색인 생성/저장", variant="primary")
+            pdf_status = gr.Textbox(label="상태", lines=3)
+
+    # 질의 영역
+    gr.Markdown("---")
+    gr.Markdown("### 💬 질의하기 (저장된 색인 대상)")
+    with gr.Row():
+        persist_dir_query = gr.Textbox(label="대상 persist_dir", value="storage_folder", scale=2)
+        response_mode = gr.Dropdown(
+            ["default", "compact", "tree_summarize", "accumulate"],
+            value="default",
+            label="response_mode",
+            scale=1,
+        )
+    user_query = gr.Textbox(
+        label="질의",
+        placeholder="예) What did the author do growing up? / 한국어로 요약해줘",
+        lines=2,
+    )
+    ask_btn = gr.Button("질의 실행 🚀", variant="primary")
+    answer_box = gr.Textbox(label="응답", lines=10)
+
+    # 이벤트 바인딩
+    def _apply_models(llm, emb, temp, tp):
+        configure_llamaindex(llm, emb, temp, tp)
+        return f"[적용됨] LLM={llm}, EMB={emb}, temperature={temp}, top_p={tp}"
+
+    apply_btn.click(
+        fn=_apply_models,
+        inputs=[llm_model, embed_model, temperature, top_p],
+        outputs=[folder_status],  # 아무 탭의 상태창 하나를 공용 알림으로 활용
+    )
+
+    build_folder_btn.click(
+        fn=index_local_folder,
+        inputs=[folder_path, persist_dir_folder],
+        outputs=[folder_status],
+    )
+
+    build_web_btn.click(
+        fn=index_web_urls,
+        inputs=[urls_text, persist_dir_web],
+        outputs=[web_status],
+    )
+
+    build_pdf_btn.click(
+        fn=index_pdf_files,
+        inputs=[pdf_paths_text, persist_dir_pdf],
+        outputs=[pdf_status],
+    )
+
+    ask_btn.click(
+        fn=query_index,
+        inputs=[persist_dir_query, user_query, response_mode],
+        outputs=[answer_box],
+    )
+
+# 최초 구동 시 기본 모델 설정 적용
+configure_llamaindex()
+
+if __name__ == "__main__":
+    demo.launch()
+
+

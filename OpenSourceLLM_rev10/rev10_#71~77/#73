@@ -1,0 +1,305 @@
+
+#73
+"""
+[OpenCode 변환본]
+Closed LLM(OpenAI) 의존 코드를 로컬 오픈소스 LLM(Ollama + DeepSeek-R1)으로 전환하고,
+Gradio UI를 붙여 바로 실행 가능한 단일 파이썬 스크립트로 구성했습니다.
+
+사전 준비:
+1) Ollama 설치 후 모델 다운로드
+   - ollama pull deepseek-r1:latest
+2) 필수 패키지 설치
+   - pip install crewai langchain langchain-community gradio
+
+실행:
+    python app.py
+브라우저에서 http://127.0.0.1:7860 접속
+"""
+
+import re
+from pathlib import Path
+from typing import Dict, Any, Tuple
+
+# CrewAI
+from crewai import Agent, Task, Crew
+
+# LangChain - Ollama용 챗 모델 (OpenAI가 아닌 오픈소스 LLM)
+from langchain_community.chat_models import ChatOllama
+
+# UI
+import gradio as gr
+
+
+# =========================
+# 1) 로컬 LLM 설정 (Ollama + DeepSeek-R1)
+# =========================
+def get_llm() -> ChatOllama:
+    """
+    로컬에서 구동되는 Ollama의 DeepSeek-R1 모델을 사용합니다.
+    - API 키 불필요
+    - Ollama는 기본적으로 http://localhost:11434 로 떠 있어야 합니다.
+    """
+    return ChatOllama(
+        model="deepseek-r1:latest",  # 필요 시 다른 로컬 모델명으로 교체 가능 (예: "llama3.1:8b")
+        temperature=0.2,
+        # num_ctx=4096,  # 문맥 길이 조정이 필요하면 활성화
+    )
+
+
+# =========================
+# 2) DeepSeek-R1의 <think> 블록 제거 유틸
+# =========================
+def strip_think(text: str) -> str:
+    """
+    DeepSeek-R1은 사유 텍스트를 <think>...</think> 태그로 내보내는 경우가 있습니다.
+    UI 가독성을 위해 해당 부분을 제거합니다.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
+# =========================
+# 3) 에이전트 정의 (원문의 의도 유지, OpenAI → Ollama)
+# =========================
+def build_agents(llm: ChatOllama):
+    """
+    사용자가 제공한 에이전트 정의를 오픈소스 LLM로 동작하도록 변환.
+    - ChatOpenAI → ChatOllama
+    - 나머지 구성/목표/배경은 동일
+    """
+    # 콘텐츠 기획자
+    planner = Agent(
+        role="콘텐츠 기획자",
+        goal="{topic}에 대한 흥미롭고 사실적인 콘텐츠를 기획합니다",
+        backstory=(
+            "당신은 {topic}에 대한 블로그 기사를 기획하고 있습니다."
+            "청중이 무언가를 배우고 정보에 입각한 결정을 내릴 수 있도록 도와주는 정보를 수집합니다."
+            "블로그 게시물의 일부가 되어야 하는 자세한 개요와 관련된 주제 및 하위 주제를 준비해야 합니다."
+            "당신의 작업은 이 주제에 대한 기사를 작성하는 콘텐츠 작가의 기초가 됩니다."
+        ),
+        llm=llm,
+        allow_delegation=False,
+        verbose=True
+    )
+
+    # 콘텐츠 작가
+    writer = Agent(
+        role="콘텐츠 작가",
+        goal="주제: {topic}에 대한 통찰력 있고 사실적인 의견 기사를 작성합니다",
+        backstory=(
+            "당신은 {topic}에 대한 새로운 의견 기사를 작성하고 있습니다."
+            "당신의 글은 콘텐츠 기획자의 작업을 기반으로 하며, 콘텐츠 기획자는 개요와 관련된 맥락을 제공합니다."
+            "콘텐츠 기획자가 제공한 개요의 주요 목표와 방향을 따릅니다."
+            "또한 콘텐츠 기획자가 제공한 정보로 뒷받침되는 객관적이고 공정한 통찰력을 제공합니다."
+            "의견 진술과 객관적 진술을 구분하여 의견 기사에서 인정합니다."
+        ),
+        llm=llm,
+        allow_delegation=False,
+        verbose=True
+    )
+
+    # 편집자
+    editor = Agent(
+        role="편집자",
+        goal="주어진 블로그 게시물을 블로그 글쓰기 스타일에 맞게 편집합니다.",
+        backstory=(
+            "당신은 콘텐츠 작가로부터 블로그 게시물을 받는 편집자입니다."
+            "당신의 목표는 블로그 게시물이 저널리즘의 모범 사례를 따르고,"
+            "의견이나 주장 시 균형 잡힌 관점을 제공하며,"
+            "가능하다면 주요 논란이 되는 주제나 의견을 피하도록 검토하는 것입니다."
+        ),
+        llm=llm,
+        allow_delegation=False,
+        verbose=True
+    )
+
+    # 번역가 (자동 언어 감지 → 한국어)
+    translator = Agent(
+        role="번역가",
+        goal="한국어로 번역합니다",
+        backstory="언어를 감지하여 한국어로 변환하여 작성해줍니다.",
+        llm=llm,
+        allow_delegation=False,
+        verbose=True,
+        memory=True
+    )
+
+    return planner, writer, editor, translator
+
+
+# =========================
+# 4) 작업(Task) 및 크루(Crew) 구성
+# =========================
+def build_tasks(planner: Agent, writer: Agent, editor: Agent, translator: Agent):
+    """
+    최소 실행 가능한 파이프라인:
+    - 기획 → 집필 → 편집 → 번역(한국어)
+    """
+    plan = Task(
+        description=(
+            "1. {topic}에 대한 최신 동향, 주요 인물, 주목할 만한 뉴스를 우선순위에 둡니다.\n"
+            "2. 대상 청중을 식별하고 그들의 관심사와 어려움을 고려합니다.\n"
+            "3. 소개, 주요 포인트, 행동 촉구를 포함한 자세한 콘텐츠 개요를 개발합니다.\n"
+            "4. SEO 키워드와 관련 데이터 또는 소스를 포함합니다."
+        ),
+        expected_output="개요, 청중 분석, SEO 키워드, 리소스를 포함한 포괄적인 콘텐츠 계획 문서.",
+        agent=planner,
+    )
+
+    write = Task(
+        description=(
+            "1. 콘텐츠 계획을 사용하여 {topic}에 대한 매력적인 블로그 게시물을 작성합니다.\n"
+            "2. SEO 키워드를 자연스럽게 통합합니다.\n"
+            "3. 섹션/부제목은 매력적인 방식으로 적절하게 명명됩니다.\n"
+            "4. 매력적인 소개, 통찰력 있는 본문, 요약 결론으로 구조화되었는지 확인합니다.\n"
+            "5. 문법 오류와 브랜드의 음성에 맞게 교정합니다.\n"
+        ),
+        expected_output="마크다운 형식의 잘 작성된 블로그 게시물(각 섹션 2~3단락, 출판 준비 완료).",
+        agent=writer,
+    )
+
+    edit = Task(
+        description="주어진 블로그 게시물을 문법 오류와 브랜드의 음성에 맞게 교정합니다.",
+        expected_output="마크다운 형식의 잘 작성된 블로그 게시물(각 섹션 2~3단락, 출판 준비 완료).",
+        agent=editor,
+    )
+
+    translate_task = Task(
+        description=(
+            "방금 완성된 블로그 게시물을 2단락, 총 5,000자 내외의 자연스러운 한국어로 변환합니다. "
+            "가능하면 용어 통일 및 문장 다듬기를 수행하세요."
+        ),
+        expected_output="한국어로 완성된 블로그 게시물(자연스러운 문체, 용어 통일).",
+        agent=translator,
+        async_execution=False,
+        output_file="translated-blog.md",
+    )
+
+    return {
+        "plan": plan,
+        "write": write,
+        "edit": edit,
+        "translate": translate_task,
+    }
+
+
+def build_crew(tasks: Dict[str, Task], agents_tuple) -> Crew:
+    """
+    Crew 인스턴스를 생성합니다.
+    """
+    planner, writer, editor, translator = agents_tuple
+    crew = Crew(
+        agents=[planner, writer, editor, translator],
+        tasks=[tasks["plan"], tasks["write"], tasks["edit"], tasks["translate"]],
+        verbose=True,
+    )
+    return crew
+
+
+# =========================
+# 5) 실행 래퍼 (Gradio에서 호출)
+# =========================
+def run_pipeline(topic: str) -> Dict[str, Any]:
+    """
+    - 입력 topic으로 Crew 파이프라인 실행
+    - 각 단계 산출물을 수집하고 DeepSeek-R1의 <think> 텍스트를 제거
+    - 번역 결과를 파일로도 저장
+    """
+    llm = get_llm()
+    agents = build_agents(llm)
+    tasks = build_tasks(*agents)
+    crew = build_crew(tasks, agents)
+
+    # Crew 실행
+    result = crew.kickoff(inputs={"topic": topic})
+
+    # 태스크별 산출물 추출 유틸
+    def safe_output(task: Task) -> str:
+        try:
+            raw = getattr(task.output, "raw", None) or str(task.output)
+            return strip_think(raw)
+        except Exception:
+            return ""
+
+    outputs = {
+        "plan": safe_output(tasks["plan"]),
+        "write": safe_output(tasks["write"]),
+        "edit": safe_output(tasks["edit"]),
+        "translate": safe_output(tasks["translate"]),
+        "final": strip_think(str(result)),
+    }
+
+    # 번역 결과 저장 (Crew의 output_file과 별개로 보조 저장)
+    if outputs["translate"]:
+        try:
+            Path("translated-blog.md").write_text(outputs["translate"], encoding="utf-8")
+        except Exception:
+            pass
+
+    return outputs
+
+
+# =========================
+# 6) Gradio UI
+# =========================
+def make_ui():
+    """
+    간단한 단일 화면 UI:
+    - 토픽 입력 → 실행
+    - 탭으로 각 단계 결과 확인
+    """
+    with gr.Blocks(theme=gr.themes.Soft()) as demo:
+        gr.Markdown("## 🧩 CrewAI × DeepSeek-R1 (Ollama) — 콘텐츠 제작 파이프라인")
+        gr.Markdown(
+            "- 로컬 오픈소스 LLM만 사용합니다 (API 키 불필요).\n"
+            "- 기획 → 집필 → 편집 → 한국어 변환 결과를 탭으로 제공합니다."
+        )
+
+        topic = gr.Textbox(
+            label="토픽(예: LangGraph, Autogen, CrewAI 비교 연구)",
+            value="다중 에이전트 시스템 구축을 위한 LangGraph, Autogen 및 CrewAI의 비교 연구",
+            lines=2,
+        )
+        run_btn = gr.Button("파이프라인 실행", variant="primary")
+
+        with gr.Tab("① 기획(Planner)"):
+            out_plan = gr.Markdown()
+        with gr.Tab("② 집필(Writer)"):
+            out_write = gr.Markdown()
+        with gr.Tab("③ 편집(Editor)"):
+            out_edit = gr.Markdown()
+        with gr.Tab("④ 한국어 변환(Translator/최종본)"):
+            out_trans = gr.Markdown()
+        with gr.Accordion("전체 결과(raw) 보기", open=False):
+            out_final = gr.Markdown()
+
+        def on_run(t):
+            if not t or not t.strip():
+                return ("토픽을 입력해주세요.", "", "", "", "")
+            res = run_pipeline(t.strip())
+            return (
+                res.get("plan", ""),
+                res.get("write", ""),
+                res.get("edit", ""),
+                res.get("translate", ""),
+                res.get("final", ""),
+            )
+
+        run_btn.click(on_run, inputs=[topic],
+                      outputs=[out_plan, out_write, out_edit, out_trans, out_final])
+        topic.submit(on_run, inputs=[topic],
+                     outputs=[out_plan, out_write, out_edit, out_trans, out_final])
+
+    return demo
+
+
+# =========================
+# 7) main
+# =========================
+if __name__ == "__main__":
+    app = make_ui()
+    # 로컬 사용: share=False (원격 공유 필요 시 True)
+    app.launch(server_name="0.0.0.0", server_port=7860, share=False)

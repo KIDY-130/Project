@@ -1,0 +1,55 @@
+#39
+import gradio as gr
+import subprocess
+import json
+
+# Ollama를 통해 로컬에 설치된 DeepSeek-R1 모델을 사용하여 질의하는 함수
+def query_deepseek(user_text):
+    """
+    Ollama CLI를 사용하여 DeepSeek-R1 모델에 질의를 보내고,
+    결과를 문자열로 반환하는 함수
+    """
+    try:
+        # subprocess로 ollama CLI 호출
+        result = subprocess.run(
+            ["ollama", "run", "deepseek-r1", user_text],
+            capture_output=True,
+            text=True
+        )
+        return result.stdout.strip()
+    except Exception as e:
+        return f"에러 발생: {str(e)}"
+
+
+# Gradio 인터페이스용 함수
+def chat_with_model(user_text):
+    """
+    Gradio 입력(user_text)을 받아 LLM 응답을 반환
+    """
+    response = query_deepseek(user_text)
+    return response
+
+
+# Gradio 인터페이스 생성
+with gr.Blocks() as demo:
+    gr.Markdown("## 💬 DeepSeek-R1 챗봇 (Ollama 기반)")
+    gr.Markdown("Python으로 피보나치 수열을 구하는 코드 같은 질문을 입력해 보세요!")
+
+    with gr.Row():
+        user_input = gr.Textbox(
+            label="질문 입력",
+            placeholder="예: Python으로 피보나치 수열 코드 작성해주세요."
+        )
+    with gr.Row():
+        output = gr.Textbox(
+            label="모델 응답",
+            placeholder="여기에 DeepSeek-R1 모델의 답변이 표시됩니다."
+        )
+
+    # 버튼 이벤트
+    submit_btn = gr.Button("전송")
+    submit_btn.click(fn=chat_with_model, inputs=user_input, outputs=output)
+
+# 실행
+if __name__ == "__main__":
+    demo.launch()

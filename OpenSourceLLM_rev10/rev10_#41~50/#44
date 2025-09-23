@@ -1,0 +1,326 @@
+#44
+"""
+LlamaIndex + Ollama (DeepSeek-R1) RAG 데모 + Reranker(재랭킹) 추가
+- 로컬 LLM/임베딩(Ollama) + SentenceTransformerRerank로 관련 문서 재순위화
+- Gradio UI에서 Reranker 온/오프, 모델명, top_k/top_n 설정 가능
+
+사전 준비
+1) Ollama 설치/실행 및 모델 준비:
+   - 언어모델:  ollama pull deepseek-r1
+   - 임베딩:    ollama pull nomic-embed-text
+2) 패키지 설치:
+   pip install "llama-index>=0.10.0" llama-index-llms-ollama llama-index-embeddings-ollama \
+               gradio requests pypdf beautifulsoup4 sentence-transformers
+"""
+
+from __future__ import annotations
+import os
+from pathlib import Path
+from typing import Dict, Optional, List
+
+import gradio as gr
+
+# LlamaIndex 핵심
+from llama_index.core import (
+    VectorStoreIndex,
+    SimpleDirectoryReader,
+    StorageContext,
+    load_index_from_storage,
+    Settings,
+)
+
+# Ollama LLM/임베딩
+from llama_index.llms.ollama import Ollama
+from llama_index.embeddings.ollama import OllamaEmbedding
+
+# 웹 로더
+from llama_index.readers.web import BeautifulSoupWebReader
+
+# ---- Reranker (여러 버전 호환 임포트) ----
+# LlamaIndex 버전에 따라 경로가 다를 수 있어 순차적으로 시도
+SentenceTransformerRerank = None
+try:
+    # 신버전
+    from llama_index.postprocessor.sentence_transformer_rerank import SentenceTransformerRerank  # type: ignore
+except Exception:
+    try:
+        # 구버전
+        from llama_index.postprocessor.sbert_rerank import SentenceTransformerRerank  # type: ignore
+    except Exception:
+        SentenceTransformerRerank = None
+
+
+# ---------------------------
+# 전역 설정: 로컬 LLM + 임베딩
+# ---------------------------
+DEFAULT_LLM_MODEL = "deepseek-r1"
+DEFAULT_EMBED_MODEL = "nomic-embed-text"
+
+def configure_llamaindex(
+    llm_model: str = DEFAULT_LLM_MODEL,
+    embed_model: str = DEFAULT_EMBED_MODEL,
+    temperature: float = 0.2,
+    top_p: float = 0.95,
+):
+    """
+    LlamaIndex 전역 Settings에 로컬 Ollama LLM/임베딩 설정
+    """
+    Settings.llm = Ollama(
+        model=llm_model,
+        request_timeout=120,
+        temperature=temperature,
+        top_p=top_p,
+    )
+    Settings.embed_model = OllamaEmbedding(model_name=embed_model)
+
+
+# ---------------------------
+# 공통 유틸: 색인 저장/불러오기
+# ---------------------------
+def build_index_from_documents(documents, persist_dir: str) -> VectorStoreIndex:
+    index = VectorStoreIndex.from_documents(documents)
+    index.storage_context.persist(persist_dir=persist_dir)
+    return index
+
+def load_index(persist_dir: str) -> VectorStoreIndex:
+    storage_context = StorageContext.from_defaults(persist_dir=persist_dir)
+    return load_index_from_storage(storage_context)
+
+
+# ---------------------------
+# 데이터 소스별 색인 생성
+# ---------------------------
+def index_local_folder(folder_path: str, persist_dir: str) -> str:
+    folder = Path(folder_path)
+    if not folder.exists() or not folder.is_dir():
+        return f"[오류] 폴더를 찾을 수 없습니다: {folder_path}"
+
+    documents = SimpleDirectoryReader(folder_path).load_data()
+    index = build_index_from_documents(documents, persist_dir)
+    _ = index.as_query_engine()
+    return f"[완료] 폴더 색인 생성 및 저장: {persist_dir} (문서 수: {len(documents)})"
+
+def index_web_urls(urls_text: str, persist_dir: str) -> str:
+    urls: List[str] = []
+    for token in urls_text.replace(",", "\n").splitlines():
+        u = token.strip()
+        if u:
+            urls.append(u)
+    if not urls:
+        return "[오류] 유효한 URL이 없습니다."
+
+    loader = BeautifulSoupWebReader()
+    documents = loader.load_data(urls=urls)
+    index = build_index_from_documents(documents, persist_dir)
+    _ = index.as_query_engine()
+    return f"[완료] 웹 문서 색인 생성 및 저장: {persist_dir} (문서 수: {len(documents)})"
+
+def index_pdf_files(file_paths_text: str, persist_dir: str) -> str:
+    paths: List[Path] = []
+    for token in file_paths_text.replace(",", "\n").splitlines():
+        p = Path(token.strip())
+        if p.exists() and p.is_file() and p.suffix.lower() == ".pdf":
+            paths.append(p)
+    if not paths:
+        return "[오류] 유효한 PDF 파일 경로가 없습니다."
+
+    documents = SimpleDirectoryReader(input_files=paths).load_data()
+    index = build_index_from_documents(documents, persist_dir)
+    _ = index.as_query_engine()
+    return f"[완료] PDF 색인 생성 및 저장: {persist_dir} (문서 수: {len(documents)})"
+
+
+# ---------------------------
+# Reranker를 포함한 Query Engine 구성
+# ---------------------------
+def make_query_engine_with_rerank(
+    index: VectorStoreIndex,
+    similarity_top_k: int = 8,
+    use_reranker: bool = True,
+    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    rerank_top_n: int = 4,
+    response_mode: str = "default",
+):
+    """
+    - similarity_top_k: 1차 벡터 검색에서 가져올 문서 수
+    - use_reranker: 재랭킹 사용 여부
+    - rerank_model: Sentence-Transformers 교차인코더 모델명
+    - rerank_top_n: 재랭킹 후 최종 상위 문서 수(<= similarity_top_k)
+    - response_mode: LlamaIndex 응답 합성 모드
+    """
+    retriever = index.as_retriever(similarity_top_k=similarity_top_k)
+
+    node_postprocessors = []
+    if use_reranker:
+        if SentenceTransformerRerank is None:
+            raise RuntimeError(
+                "SentenceTransformerRerank 임포트 실패. 'sentence-transformers' 및 LlamaIndex 버전을 확인하세요.\n"
+                "pip install sentence-transformers"
+            )
+        reranker = SentenceTransformerRerank(
+            top_n=rerank_top_n,
+            model=rerank_model,
+        )
+        node_postprocessors.append(reranker)
+
+    qe = index.as_query_engine(
+        retriever=retriever,
+        node_postprocessors=node_postprocessors,
+        response_mode=response_mode,
+    )
+    return qe
+
+
+# ---------------------------
+# 질의 함수 (UI에서 호출)
+# ---------------------------
+def query_index(
+    persist_dir: str,
+    user_query: str,
+    response_mode: str,
+    similarity_top_k: int,
+    use_reranker: bool,
+    rerank_model: str,
+    rerank_top_n: int,
+) -> str:
+    if not user_query.strip():
+        return "[오류] 질의 내용을 입력하세요."
+
+    try:
+        index = load_index(persist_dir)
+    except Exception as e:
+        return f"[오류] 색인을 불러올 수 없습니다. 먼저 색인을 생성하세요.\n- persist_dir: {persist_dir}\n- 상세: {e}"
+
+    try:
+        qe = make_query_engine_with_rerank(
+            index=index,
+            similarity_top_k=int(similarity_top_k),
+            use_reranker=bool(use_reranker),
+            rerank_model=rerank_model.strip(),
+            rerank_top_n=int(rerank_top_n),
+            response_mode=response_mode,
+        )
+    except Exception as e:
+        return f"[오류] Query Engine 생성 실패: {e}"
+
+    res = qe.query(user_query)
+    return str(res)
+
+
+# ---------------------------
+# Gradio UI
+# ---------------------------
+with gr.Blocks(title="LlamaIndex + Ollama (DeepSeek-R1) RAG 데모 + Reranker") as demo:
+    gr.Markdown("## 🔎 LlamaIndex + Ollama (DeepSeek-R1) + Reranker")
+    gr.Markdown(
+        "- 로컬 **Ollama LLM/임베딩** 기반 RAG\n"
+        "- **SentenceTransformerRerank**로 재순위화(교차 인코더)\n"
+        "- 작은 모델부터 시작해 성능/속도를 균형 있게 조절하세요"
+    )
+
+    # 전역 모델 설정
+    with gr.Accordion("⚙️ 전역 LLM/임베딩 설정 (Ollama)", open=True):
+        with gr.Row():
+            llm_model = gr.Textbox(label="LLM 모델", value=DEFAULT_LLM_MODEL, scale=2)
+            embed_model = gr.Textbox(label="임베딩 모델", value=DEFAULT_EMBED_MODEL, scale=2)
+        with gr.Row():
+            temperature = gr.Slider(0.0, 1.5, value=0.2, step=0.05, label="temperature", scale=1)
+            top_p = gr.Slider(0.1, 1.0, value=0.95, step=0.05, label="top_p", scale=1)
+        apply_btn = gr.Button("모델 설정 적용", variant="primary")
+
+    # 색인 생성 탭
+    with gr.Tabs():
+        with gr.Tab("📁 폴더 색인"):
+            with gr.Row():
+                folder_path = gr.Textbox(label="폴더 경로", value="data", scale=3)
+                persist_dir_folder = gr.Textbox(label="저장 경로(persist_dir)", value="storage_folder", scale=2)
+            build_folder_btn = gr.Button("폴더 색인 생성/저장", variant="primary")
+            folder_status = gr.Textbox(label="상태", lines=3)
+
+        with gr.Tab("🌐 웹 URL 색인"):
+            urls_text = gr.Textbox(
+                label="URL 목록 (쉼표/줄바꿈 구분)",
+                placeholder="예) https://www.law.go.kr/법령/대한민국헌법",
+                lines=3,
+            )
+            persist_dir_web = gr.Textbox(label="저장 경로(persist_dir)", value="storage_web")
+            build_web_btn = gr.Button("웹 색인 생성/저장", variant="primary")
+            web_status = gr.Textbox(label="상태", lines=3)
+
+        with gr.Tab("📄 PDF 색인"):
+            pdf_paths_text = gr.Textbox(
+                label="PDF 경로 목록 (쉼표/줄바꿈 구분)",
+                placeholder="예) ./attention.pdf",
+                lines=3,
+            )
+            persist_dir_pdf = gr.Textbox(label="저장 경로(persist_dir)", value="storage_pdf")
+            build_pdf_btn = gr.Button("PDF 색인 생성/저장", variant="primary")
+            pdf_status = gr.Textbox(label="상태", lines=3)
+
+    # 질의 영역 + Reranker 설정
+    gr.Markdown("---")
+    gr.Markdown("### 💬 질의하기 (저장된 색인 대상) + 🔁 Reranker 설정")
+    with gr.Row():
+        persist_dir_query = gr.Textbox(label="대상 persist_dir", value="storage_folder", scale=2)
+        response_mode = gr.Dropdown(
+            ["default", "compact", "tree_summarize", "accumulate"],
+            value="default",
+            label="response_mode",
+            scale=1,
+        )
+    with gr.Row():
+        similarity_top_k = gr.Slider(1, 50, value=8, step=1, label="similarity_top_k (1차 검색 개수)")
+        use_reranker = gr.Checkbox(label="Reranker 사용", value=True)
+    with gr.Row():
+        rerank_model = gr.Textbox(
+            label="Reranker 모델 (Sentence-Transformers)",
+            value="cross-encoder/ms-marco-MiniLM-L-6-v2",
+            placeholder="예) cross-encoder/ms-marco-MiniLM-L-6-v2, BAAI/bge-reranker-base",
+        )
+        rerank_top_n = gr.Slider(1, 50, value=4, step=1, label="rerank_top_n (재랭킹 후 최종 개수)")
+
+    user_query = gr.Textbox(
+        label="질의",
+        placeholder="예) What did the author do growing up? / 한국어로 요약해줘",
+        lines=2,
+    )
+    ask_btn = gr.Button("질의 실행 🚀", variant="primary")
+    answer_box = gr.Textbox(label="응답", lines=12)
+
+    # 이벤트 바인딩
+    def _apply_models(llm, emb, temp, tp):
+        configure_llamaindex(llm, emb, temp, tp)
+        return f"[적용됨] LLM={llm}, EMB={emb}, temperature={temp}, top_p={tp}"
+
+    apply_btn.click(
+        fn=_apply_models,
+        inputs=[llm_model, embed_model, temperature, top_p],
+        outputs=[folder_status],
+    )
+    build_folder_btn.click(fn=index_local_folder, inputs=[folder_path, persist_dir_folder], outputs=[folder_status])
+    build_web_btn.click(fn=index_web_urls, inputs=[urls_text, persist_dir_web], outputs=[web_status])
+    build_pdf_btn.click(fn=index_pdf_files, inputs=[pdf_paths_text, persist_dir_pdf], outputs=[pdf_status])
+
+    ask_btn.click(
+        fn=query_index,
+        inputs=[
+            persist_dir_query,
+            user_query,
+            response_mode,
+            similarity_top_k,
+            use_reranker,
+            rerank_model,
+            rerank_top_n,
+        ],
+        outputs=[answer_box],
+    )
+
+# 최초 1회 전역 모델 설정
+configure_llamaindex()
+
+if __name__ == "__main__":
+    demo.launch()
+
+
+
+

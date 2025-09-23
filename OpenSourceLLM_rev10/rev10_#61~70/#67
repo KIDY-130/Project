@@ -1,0 +1,483 @@
+#67
+"""
+OpenCode 변환본: (Closed LLM + Jupyter 스크립트) → (Gradio + Ollama DeepSeek-R1 로컬 멀티모달 RAG)
+
+핵심 변경점
+- ✅ OpenAI/ChatGPT 의존 제거, API Key 불필요
+- ✅ Gradio GUI 제공 (업로드→인덱싱→검색/답변)
+- ✅ 텍스트 LLM: DeepSeek-R1 (Ollama)
+- ✅ 비전 LLM: LLaVA (Ollama, 이미지 요약/멀티모달 답변)
+- ✅ PDF 파싱: unstructured.partition.pdf (이미지/표/텍스트 추출)
+- ✅ 임베딩/벡터DB: OpenCLIPEmbeddings + Chroma
+- ✅ Multi-Vector RAG: 요약문(텍스트/표/이미지)을 인덱싱하고 원문/원이미지 반환
+- ✅ 한국어 최적화: 모든 프롬프트/출력 한글화
+
+사전 준비 (터미널 1회 실행)
+1) Ollama 설치 후 실행: https://ollama.com
+2) 필요한 로컬 모델 풀
+   - ollama pull deepseek-r1
+   - ollama pull llava:13b      # 또는 llava:7b
+   - ollama pull nomic-embed-text
+3) 파이썬 패키지
+   - pip install -U gradio langchain langchain-community langchain-experimental langchain-text-splitters chromadb unstructured[pdf] pillow tiktoken requests pydantic lxml
+   - (선택) poppler, tesseract 등 unstructured 백엔드 의존성 OS 설치 필요할 수 있음
+
+실행
+- python app.py
+"""
+
+import os
+import io
+import re
+import json
+import base64
+import uuid
+import tempfile
+import typing as T
+import requests
+import gradio as gr
+
+from PIL import Image
+
+# LangChain core
+from langchain_core.documents import Document
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.output_parsers import StrOutputParser
+from langchain.prompts import ChatPromptTemplate
+
+# LangChain community / experimental
+from langchain_community.chat_models import ChatOllama
+from langchain_community.vectorstores import Chroma
+from langchain_experimental.open_clip import OpenCLIPEmbeddings
+from langchain.storage import InMemoryStore
+from langchain.retrievers.multi_vector import MultiVectorRetriever
+from langchain_text_splitters import CharacterTextSplitter
+
+# Unstructured (PDF 파싱)
+from unstructured.partition.pdf import partition_pdf
+
+
+# =========================
+# 설정값 (필요시 변경)
+# =========================
+DEEPSEEK_MODEL = "deepseek-r1"     # 텍스트 LLM (Ollama)
+LLAVA_MODEL    = "llava:13b"       # 비전 LLM (Ollama) - 이미지 요약/멀티모달 답변
+EMBED_MODEL    = "nomic-embed-text"  # 텍스트 임베딩 (Ollama용, 단 여기서는 OpenCLIP으로 인덱싱)
+# 주의: 아래 벡터DB 임베딩은 OpenCLIPEmbeddings 사용(텍스트 요약에 적합, 이미지 요약 텍스트도 동일 처리)
+
+CHUNK_SIZE     = 2000
+CHUNK_OVERLAP  = 200
+COLLECTION_NAME = "mm_rag_finance"
+
+# =========================
+# PDF 파서
+# =========================
+def extract_pdf_elements(pdf_path: str) -> T.List:
+    """
+    PDF 파일에서 이미지, 테이블, 텍스트 블록을 추출합니다.
+    - 이미지: 지정한 디렉터리에 저장
+    - 테이블: 텍스트화된 테이블 요소
+    - 텍스트: 제목 단위로 큰 블록 생성(길면 자동 분할)
+    """
+    out_dir = os.path.join(os.path.dirname(pdf_path), "figures")
+    os.makedirs(out_dir, exist_ok=True)
+
+    elements = partition_pdf(
+        filename=pdf_path,
+        extract_images_in_pdf=True,
+        infer_table_structure=True,
+        chunking_strategy="by_title",
+        max_characters=4000,
+        new_after_n_chars=3800,
+        combine_text_under_n_chars=2000,
+        image_output_dir_path=out_dir,
+    )
+    return elements
+
+
+def categorize_elements(raw_pdf_elements):
+    """
+    Unstructured elements → 텍스트/테이블로 분류 (이미지는 디스크에 저장됨)
+    """
+    tables, texts = [], []
+    for el in raw_pdf_elements:
+        t = str(type(el))
+        if "unstructured.documents.elements.Table" in t:
+            tables.append(str(el))
+        elif "unstructured.documents.elements.CompositeElement" in t:
+            texts.append(str(el))
+    return texts, tables
+
+
+# =========================
+# 텍스트/표 요약 (DeepSeek-R1)
+# =========================
+SUMMARY_PROMPT_KO = """당신은 표와 텍스트를 검색 최적화 형태로 요약하는 도우미입니다.
+- 핵심 키워드, 수치, 고유명사를 포함해 간결하게 요약하세요.
+- 나중에 원문을 찾기 쉽게 제목/주제/지표명을 강조하세요.
+
+요약 대상:
+{element}
+"""
+
+def summarize_batch_text(elements: T.List[str], model_name: str = DEEPSEEK_MODEL, max_concurrency: int = 4) -> T.List[str]:
+    """
+    DeepSeek-R1로 텍스트/테이블을 배치 요약 (LangChain Runnable batch)
+    """
+    if not elements:
+        return []
+    prompt = ChatPromptTemplate.from_template(SUMMARY_PROMPT_KO)
+    llm = ChatOllama(model=model_name, temperature=0.2)
+    chain = {"element": lambda x: x} | prompt | llm | StrOutputParser()
+    # 간단한 병렬 처리: chunk 단위로 나누어 순차 배치
+    out = []
+    for i in range(0, len(elements), max_concurrency):
+        out.extend(chain.batch(elements[i:i+max_concurrency]))
+    return out
+
+
+# =========================
+# 이미지 유틸
+# =========================
+def encode_image(image_path: str) -> str:
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def list_extracted_images(figures_dir: str) -> T.List[str]:
+    if not os.path.isdir(figures_dir):
+        return []
+    imgs = []
+    for fn in sorted(os.listdir(figures_dir)):
+        if fn.lower().endswith((".jpg", ".jpeg", ".png")):
+            imgs.append(os.path.join(figures_dir, fn))
+    return imgs
+
+
+# =========================
+# LLaVA 호출 (Ollama REST) — 이미지 요약/멀티모달 응답
+# =========================
+def ollama_generate_with_images(prompt: str, images_b64: T.List[str], model: str = LLAVA_MODEL, stream: bool = True, url: str = "http://localhost:11434/api/generate") -> str:
+    """
+    Ollama /api/generate 를 사용해 이미지 포함 프롬프트로 LLaVA 호출
+    """
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "images": images_b64,
+        "stream": stream,
+    }
+    r = requests.post(url, json=payload, stream=stream, timeout=600)
+    r.raise_for_status()
+    if stream:
+        full = ""
+        for line in r.iter_lines():
+            if not line:
+                continue
+            obj = json.loads(line)
+            full += obj.get("response", "")
+        return full
+    else:
+        return r.json().get("response", "")
+
+
+# =========================
+# 이미지 요약 (LLaVA)
+# =========================
+IMAGE_SUMMARY_PROMPT_KO = """당신은 투자 리서치 보조원입니다.
+다음 이미지를 검색 최적화 요약으로 간결하게 정리하세요.
+- 차트/축/기간/핵심지표/추세/이상치/결론을 포함
+- 한국어로 3~5문장
+
+이미지 설명:
+"""
+
+def summarize_images_base64(images_b64: T.List[str]) -> T.List[str]:
+    if not images_b64:
+        return []
+    summaries = []
+    for b64 in images_b64:
+        s = ollama_generate_with_images(IMAGE_SUMMARY_PROMPT_KO, [b64], model=LLAVA_MODEL, stream=True)
+        summaries.append(s.strip())
+    return summaries
+
+
+# =========================
+# 멀티 벡터 리트리버 (요약문 인덱싱 → 원문/원이미지 반환)
+# =========================
+def create_multi_vector_retriever(
+    text_summaries: T.List[str],
+    texts: T.List[str],
+    table_summaries: T.List[str],
+    tables: T.List[str],
+    image_summaries: T.List[str],
+    images_base64: T.List[str],
+) -> MultiVectorRetriever:
+    """
+    - vectorstore(요약문 임베딩) + docstore(원문/원이미지 Base64) 구성
+    - 요약문으로 검색 → id로 원문 payload 반환
+    """
+    embedding = OpenCLIPEmbeddings()  # 텍스트 임베딩
+    vectorstore = Chroma(collection_name=COLLECTION_NAME, embedding_function=embedding)
+    store = InMemoryStore()
+    id_key = "doc_id"
+
+    retriever = MultiVectorRetriever(
+        vectorstore=vectorstore,
+        docstore=store,
+        id_key=id_key,
+    )
+
+    def add_documents(summaries: T.List[str], originals: T.List[str]):
+        doc_ids = [str(uuid.uuid4()) for _ in originals]
+        # 요약문을 벡터DB에 저장
+        summary_docs = [Document(page_content=s, metadata={id_key: doc_ids[i]}) for i, s in enumerate(summaries)]
+        retriever.vectorstore.add_documents(summary_docs)
+        # 원문을 별도 저장(검색 후 반환하기 위함)
+        retriever.docstore.mset(list(zip(doc_ids, originals)))
+
+    if text_summaries:
+        add_documents(text_summaries, texts)
+    if table_summaries:
+        add_documents(table_summaries, tables)
+    if image_summaries:
+        add_documents(image_summaries, images_base64)
+
+    return retriever
+
+
+# =========================
+# 검색 결과 → 이미지/텍스트 분리 & 리사이즈
+# =========================
+def looks_like_base64(sb: str) -> bool:
+    return re.match(r"^[A-Za-z0-9+/]+={0,2}$", sb or "") is not None
+
+def is_image_data(b64data: str) -> bool:
+    try:
+        header = base64.b64decode(b64data)[:8]
+    except Exception:
+        return False
+    signatures = {
+        b"\xff\xd8\xff": "jpg",
+        b"\x89PNG\r\n\x1a\n": "png",
+        b"GIF8": "gif",
+        b"RIFF": "webp",
+    }
+    return any(header.startswith(sig) for sig in signatures)
+
+def resize_base64_image(b64: str, size=(1024, 576)) -> str:
+    img_data = base64.b64decode(b64)
+    img = Image.open(io.BytesIO(img_data))
+    img = img.convert("RGB")
+    img = img.resize(size, Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+def split_image_text_types(docs: T.List[T.Union[Document, str]]) -> T.Dict[str, T.List[str]]:
+    images, texts = [], []
+    for d in docs:
+        content = d.page_content if isinstance(d, Document) else str(d)
+        if looks_like_base64(content) and is_image_data(content):
+            images.append(resize_base64_image(content))
+        else:
+            texts.append(content)
+    return {"images": images, "texts": texts}
+
+
+# =========================
+# 멀티모달 RAG 응답
+# =========================
+FINAL_INSTRUCT_KO = """당신은 금융 애널리스트입니다.
+아래 텍스트/표/이미지(차트)를 종합해 투자 관점의 핵심 인사이트를 한국어로 제시하세요.
+
+요구사항:
+- 핵심 요약(3~5문장)
+- 근거: 지표/수치/기간을 인용
+- 리스크 요인과 관찰 포인트
+- 추가로 확인해야 할 데이터 2~3개
+
+사용자 질문: {question}
+
+참고 텍스트/표:
+{context_texts}
+"""
+
+def answer_with_rag(question: str, retrieved_docs: T.List[T.Union[Document, str]]) -> str:
+    data = split_image_text_types(retrieved_docs)
+    context_texts = "\n\n".join(data["texts"]) if data["texts"] else "(텍스트 없음)"
+
+    # 이미지가 존재하면 LLaVA 멀티모달로, 아니면 DeepSeek-R1 사용
+    if data["images"]:
+        prompt = FINAL_INSTRUCT_KO.format(question=question, context_texts=context_texts)
+        return ollama_generate_with_images(prompt, data["images"], model=LLAVA_MODEL, stream=True)
+    else:
+        prompt = ChatPromptTemplate.from_template(FINAL_INSTRUCT_KO)
+        llm = ChatOllama(model=DEEPSEEK_MODEL, temperature=0.2)
+        chain = {"question": RunnablePassthrough(), "context_texts": lambda _: context_texts} | prompt | llm | StrOutputParser()
+        return chain.invoke(question)
+
+
+# =========================
+# Gradio 앱 로직
+# =========================
+class SessionState:
+    def __init__(self):
+        self.texts: T.List[str] = []
+        self.tables: T.List[str] = []
+        self.images_b64: T.List[str] = []
+        self.text_summaries: T.List[str] = []
+        self.table_summaries: T.List[str] = []
+        self.image_summaries: T.List[str] = []
+        self.retriever: T.Optional[MultiVectorRetriever] = None
+        self.figures_dir: T.Optional[str] = None
+        self.pdf_paths: T.List[str] = []
+
+STATE = SessionState()
+
+def build_index(pdf_files: T.List[gr.File], summarize_texts: bool, progress=gr.Progress(track_tqdm=True)):
+    if not pdf_files:
+        return "📄 PDF를 업로드하세요.", None, None, None
+
+    # 임시 디렉터리에 복사
+    tmpdir = tempfile.TemporaryDirectory()
+    pdf_paths = []
+    for f in pdf_files:
+        dst = os.path.join(tmpdir.name, os.path.basename(f.name))
+        with open(dst, "wb") as out:
+            out.write(open(f.name, "rb").read())
+        pdf_paths.append(dst)
+
+    # PDF 파싱
+    all_texts, all_tables, all_images_b64 = [], [], []
+    figures_dir_last = None
+
+    for p in pdf_paths:
+        progress(0.1, desc=f"PDF 파싱 중: {os.path.basename(p)}")
+        elements = extract_pdf_elements(p)
+        texts, tables = categorize_elements(elements)
+        all_texts.extend(texts)
+        all_tables.extend(tables)
+
+        figures_dir = os.path.join(os.path.dirname(p), "figures")
+        figures_dir_last = figures_dir
+        img_paths = list_extracted_images(figures_dir)
+        all_images_b64.extend([encode_image(ip) for ip in img_paths])
+
+    # 텍스트 분할
+    splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    texts_2k = splitter.split_text(" ".join(all_texts)) if all_texts else []
+
+    # 요약 생성
+    progress(0.5, desc="요약 생성 중 (텍스트/표/이미지)")
+    text_summaries = summarize_batch_text(texts_2k, DEEPSEEK_MODEL) if (texts_2k and summarize_texts) else texts_2k
+    table_summaries = summarize_batch_text(all_tables, DEEPSEEK_MODEL) if all_tables else []
+    image_summaries = summarize_images_base64(all_images_b64) if all_images_b64 else []
+
+    # 리트리버 구축
+    progress(0.8, desc="인덱스 구축 중 (Chroma)")
+    retriever = create_multi_vector_retriever(
+        text_summaries=text_summaries,
+        texts=texts_2k,
+        table_summaries=table_summaries,
+        tables=all_tables,
+        image_summaries=image_summaries,
+        images_base64=all_images_b64,
+    )
+
+    # 상태 저장
+    STATE.texts = texts_2k
+    STATE.tables = all_tables
+    STATE.images_b64 = all_images_b64
+    STATE.text_summaries = text_summaries
+    STATE.table_summaries = table_summaries
+    STATE.image_summaries = image_summaries
+    STATE.retriever = retriever
+    STATE.figures_dir = figures_dir_last
+    STATE.pdf_paths = pdf_paths
+
+    # 갤러리 프리뷰용 이미지 (앞 6개)
+    preview_imgs = []
+    for b64 in all_images_b64[:6]:
+        preview_imgs.append(Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB"))
+
+    status = f"✅ 인덱스 구축 완료\n- 텍스트 청크: {len(texts_2k)}개\n- 테이블: {len(all_tables)}개\n- 이미지: {len(all_images_b64)}개"
+    return status, preview_imgs, "\n\n".join(text_summaries[:3]) if text_summaries else "", "\n\n".join(image_summaries[:3]) if image_summaries else ""
+
+
+def run_query(question: str, top_k: int):
+    if not question.strip():
+        return "질문을 입력하세요.", None
+    if not STATE.retriever:
+        return "먼저 PDF를 업로드하고 [인덱스 만들기]를 눌러주세요.", None
+
+    # 검색
+    docs = STATE.retriever.vectorstore.similarity_search(question, k=top_k)
+    # docstore에서 원문/이미지 치환
+    resolved = []
+    for d in docs:
+        doc_id = d.metadata.get("doc_id")
+        original = STATE.retriever.docstore.mget([doc_id])[0] if doc_id else None
+        if original is not None:
+            resolved.append(original if isinstance(original, Document) else Document(page_content=str(original)))
+        else:
+            resolved.append(d)
+
+    # 답변 생성
+    answer = answer_with_rag(question, resolved)
+
+    # 시각 프리뷰 (상위 이미지 3장)
+    split = split_image_text_types(resolved)
+    img_preview = []
+    for b64 in split["images"][:3]:
+        img_preview.append(Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB"))
+
+    return answer, img_preview if img_preview else None
+
+
+# =========================
+# Gradio UI
+# =========================
+with gr.Blocks(title="멀티모달 금융 RAG (Local · DeepSeek-R1 · LLaVA)") as demo:
+    gr.Markdown("## 📊 멀티모달 금융 RAG — PDF에서 텍스트/표/이미지를 추출해 로컬 LLM으로 분석합니다.")
+    gr.Markdown(
+        "- **LLM**: DeepSeek-R1 (텍스트), LLaVA (이미지/멀티모달) — *Ollama 로컬 실행*\n"
+        "- **파서**: unstructured (이미지/표/텍스트 추출)\n"
+        "- **벡터DB**: Chroma + OpenCLIPEmbeddings (요약문 인덱싱)\n"
+        "- **개인정보/비용**: API Key 불필요, 모든 처리 로컬 수행\n"
+    )
+
+    with gr.Row():
+        pdf_in = gr.File(label="PDF 업로드 (복수 선택 가능)", file_types=[".pdf"], file_count="multiple")
+        summarize_ck = gr.Checkbox(label="텍스트/표 요약 사용 (권장)", value=True)
+        build_btn = gr.Button("인덱스 만들기")
+
+    status_out = gr.Markdown()
+    with gr.Row():
+        img_gallery = gr.Gallery(label="추출 이미지 미리보기", columns=3, rows=2, height="auto")
+    with gr.Row():
+        textsum_out = gr.Markdown(label="텍스트 요약 (일부)")
+        imgsum_out = gr.Markdown(label="이미지 요약 (일부)")
+
+    gr.Markdown("---")
+    with gr.Row():
+        query_in = gr.Textbox(label="질문", placeholder="예) 코스피 관련해서 전망을 종합적으로 알려줘")
+        topk_in = gr.Slider(2, 10, value=4, step=1, label="검색 상위 K")
+        run_btn = gr.Button("질문하기")
+
+    answer_out = gr.Markdown()
+    with gr.Row():
+        ans_gallery = gr.Gallery(label="답변에 사용된 이미지 (일부)", columns=3, rows=1, height="auto")
+
+    build_btn.click(fn=build_index, inputs=[pdf_in, summarize_ck], outputs=[status_out, img_gallery, textsum_out, imgsum_out])
+    run_btn.click(fn=run_query, inputs=[query_in, topk_in], outputs=[answer_out, ans_gallery])
+
+if __name__ == "__main__":
+    # 외부 접속 필요시 server_name="0.0.0.0"
+    demo.launch(server_name="0.0.0.0", server_port=7860)
+
+
+
+
+
+

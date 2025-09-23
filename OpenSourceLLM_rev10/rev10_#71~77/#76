@@ -1,0 +1,114 @@
+#76
+# main.py
+# FastAPI 엔드포인트 + Gradio UI(동일 서버 /ui 경로로 접근)
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import asyncio
+import json
+import logging
+from typing import Any, Dict
+
+from crew import create_crew
+from agents import strip_think  # 결과 가독성 향상용
+import gradio as gr
+from gradio.routes import mount_gradio_app
+
+# 로깅
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 직렬화 유틸
+def serialize_object(obj):
+    if isinstance(obj, tuple):
+        return list(obj)
+    elif isinstance(obj, dict):
+        return obj
+    elif hasattr(obj, '__dict__'):
+        return obj.__dict__
+    else:
+        return str(obj)
+
+def custom_json_dumps(data):
+    return json.dumps(data, default=serialize_object, ensure_ascii=False, indent=2)
+
+# FastAPI 앱
+app = FastAPI(
+    title="CrewAI Content Generation API (Ollama / DeepSeek-R1)",
+    version="1.0",
+    description="토픽을 기반으로 CrewAI(오픈소스 LLM)로 콘텐츠를 생성하는 API + UI",
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 입력 모델
+class TopicInput(BaseModel):
+    topic: str
+
+# === API: /crewai ===
+@app.post("/crewai")
+async def crewai_endpoint(input: TopicInput):
+    try:
+        crew = create_crew()
+        # crew.kickoff는 동기 함수이므로 스레드로 돌림
+        result = await asyncio.to_thread(crew.kickoff, {"topic": input.topic})
+
+        # 가능한 경우 Task별 산출물도 함께 구성 (없으면 전체 문자열만 반환)
+        try:
+            # crew.tasks는 내부적으로 접근 가능하지만, 안전하게 문자열 결과만 우선 반환
+            payload: Dict[str, Any] = {
+                "topic": input.topic,
+                "result_text": strip_think(str(result)),
+            }
+        except Exception:
+            payload = {"topic": input.topic, "result_text": strip_think(str(result))}
+
+        return JSONResponse(content=json.loads(custom_json_dumps(payload)))
+    except Exception as e:
+        logger.exception("CrewAI endpoint 에러 발생")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# === Gradio UI (동일 FastAPI에 마운트: /ui) ===
+def build_gradio():
+    with gr.Blocks(theme=gr.themes.Soft()) as demo:
+        gr.Markdown("## 🧩 CrewAI × DeepSeek-R1 (Ollama) — 콘텐츠 생성 UI")
+        gr.Markdown("- 토픽을 입력하고 실행하면, 로컬 오픈소스 LLM으로 결과를 생성합니다.")
+
+        topic = gr.Textbox(
+            label="토픽",
+            value="다중 에이전트 시스템 구축을 위한 LangGraph, Autogen 및 CrewAI의 비교 연구",
+            lines=2
+        )
+        run_btn = gr.Button("실행", variant="primary")
+        out = gr.Markdown(label="결과")
+
+        async def run_ui(t: str):
+            if not t or not t.strip():
+                return "토픽을 입력하세요."
+            crew = create_crew()
+            result = await asyncio.to_thread(crew.kickoff, {"topic": t.strip()})
+            return strip_think(str(result))
+
+        run_btn.click(run_ui, inputs=[topic], outputs=[out])
+        topic.submit(run_ui, inputs=[topic], outputs=[out])
+
+    return demo
+
+# FastAPI에 Gradio 앱 마운트
+demo = build_gradio()
+app = mount_gradio_app(app, demo, path="/ui")
+
+# 로컬 실행 진입점 (uvicorn main:app 로 실행 권장)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+

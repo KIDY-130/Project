@@ -1,0 +1,341 @@
+#66
+"""
+OpenCode 변환본: Streamlit + OpenAI → Gradio + Ollama(DeepSeek-R1) 로컬 RAG-PDF 앱
+
+요약
+- 폐쇄형(OpenAI) 의존 코드를 오픈소스 LLM 환경(로컬 Ollama)으로 전환
+- Gradio GUI 사용 (Streamlit 제거)
+- DeepSeek-R1(추론형) + BM25 + FAISS + Multi-Query + RAG-Fusion(Reciprocal Rank Fusion)
+- 로컬 임베딩: nomic-embed-text (Ollama)
+- API Key 불필요, 로컬에서 Ollama 데몬이 실행 중이어야 합니다.
+
+사전 준비 (터미널에서 1회만 수행)
+1) Ollama 설치 및 실행: https://ollama.com
+2) 모델 다운로드:
+   - ollama pull deepseek-r1
+   - ollama pull nomic-embed-text
+3) 앱 실행:
+   - python app.py
+"""
+
+import os
+import tempfile
+import typing as T
+import gradio as gr
+
+# LangChain core & community
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from langchain.prompts import ChatPromptTemplate
+
+# Ollama LLM/Embeddings
+from langchain_community.chat_models import ChatOllama
+from langchain_community.embeddings import OllamaEmbeddings
+
+# PDF 로더
+from langchain_community.document_loaders import PyPDFLoader
+
+# 텍스트 분할기
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# 벡터 스토어/FAISS
+from langchain_community.vectorstores import FAISS
+import faiss
+from langchain_community.docstore.in_memory import InMemoryDocstore
+
+# BM25 / 앙상블 리트리버
+try:
+    # LangChain 0.2+
+    from langchain_community.retrievers import BM25Retriever
+except ImportError:
+    # 구버전 호환
+    from langchain.retrievers import BM25Retriever
+
+from langchain.retrievers import EnsembleRetriever
+
+# 직렬화 유틸 (RRF 스코어 결합용)
+from langchain.load import dumps, loads
+
+
+# =========================
+# 설정값 (필요시 수정)
+# =========================
+DEEPSEEK_MODEL = "deepseek-r1"          # Ollama 모델 태그 예: "deepseek-r1", "deepseek-r1:32b" 등
+EMBED_MODEL    = "nomic-embed-text"     # Ollama 임베딩 모델
+CHUNK_SIZE     = 500
+CHUNK_OVERLAP  = 50
+
+# =========================
+# PDF → 문서 로드 함수
+# =========================
+def pdf_to_documents(pdf_paths: T.List[str]):
+    """여러 PDF 파일 경로를 받아 LangChain 문서 리스트로 로드."""
+    all_pages = []
+    for path in pdf_paths:
+        loader = PyPDFLoader(path)
+        pages = loader.load_and_split()
+        all_pages.extend(pages)
+    return all_pages
+
+# =========================
+# 문서 포맷 유틸
+# =========================
+def format_docs(docs):
+    """검색된 문서들을 하나의 문자열 컨텍스트로 병합."""
+    return "\n\n".join(doc.page_content for doc in docs)
+
+# =========================
+# Multi-Query (질문 확장) 프롬프트
+# =========================
+PERSPECTIVE_TEMPLATE = """
+당신은 AI 언어 모델 조수입니다. 아래 사용자 질문을 벡터 데이터베이스 검색에 유리하도록
+다섯 가지 '서로 다른' 버전으로 다시 작성하세요. 각 줄에 하나의 쿼리를 출력하세요.
+중복/유사 문구는 피하고, 핵심 키워드는 유지하되 관점(범위/동의어/세부)을 다양화하세요.
+
+원본 질문: {question}
+"""
+
+# =========================
+# Reciprocal Rank Fusion
+# =========================
+def reciprocal_rank_fusion(results: T.List[T.List], k: int = 60, top_n: int = 2):
+    """
+    여러 리트리버 결과를 RRF로 결합.
+    results: [[doc1, doc2, ...], [docA, docB, ...], ...]
+    """
+    fused_scores = {}
+    for docs in results:
+        for rank, doc in enumerate(docs):
+            doc_str = dumps(doc)
+            # 초기화
+            if doc_str not in fused_scores:
+                fused_scores[doc_str] = 0.0
+            # RRF 가중치 합산
+            fused_scores[doc_str] += 1.0 / (rank + k)
+
+    # 스코어로 내림차순 정렬 후 상위 top_n 반환
+    reranked_results = [
+        (loads(doc), score)
+        for doc, score in sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+    ]
+    # (문서, 스코어) 목록 → 문서만 슬라이스
+    return [doc for doc, _ in reranked_results[:top_n]]
+
+# =========================
+# 인덱스 구축 함수
+# =========================
+def build_retriever_ensemble(docs):
+    """
+    - 텍스트 분할
+    - 임베딩/FAISS 벡터스토어
+    - BM25 / FAISS → 앙상블 리트리버
+    """
+    # 1) 청크 분할
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP
+    )
+    splits = splitter.split_documents(docs)
+
+    # 2) 임베딩 & FAISS 인덱스
+    embed = OllamaEmbeddings(model=EMBED_MODEL)
+    # 임베딩 차원 계산 (샘플 문장 1개)
+    dim = len(embed.embed_query("hello world"))
+    index = faiss.IndexFlatL2(dim)
+
+    vectorstore = FAISS(
+        embedding_function=embed,
+        index=index,
+        docstore=InMemoryDocstore(),
+        index_to_docstore_id={}
+    )
+    vectorstore.add_documents(splits, ids=list(map(str, range(len(splits)))))
+
+    # FAISS 리트리버 (MMR)
+    faiss_retriever = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": 1, "fetch_k": 4}
+    )
+
+    # 3) BM25 리트리버
+    bm25_retriever = BM25Retriever.from_documents(splits)
+    bm25_retriever.k = 2
+
+    # 4) 앙상블 (가중합은 필요/성능에 맞게 조정)
+    ensemble = EnsembleRetriever(
+        retrievers=[bm25_retriever, faiss_retriever],
+        weights=[0.2, 0.8],
+    )
+
+    return ensemble
+
+# =========================
+# RAG 체인 구성
+# =========================
+def build_rag_chain(ensemble_retriever: EnsembleRetriever, model_name: str = DEEPSEEK_MODEL):
+    """
+    - Multi-Query 생성용 LLM
+    - RAG-Fusion (Ensemble.map → RRF)
+    - 최종 답변 LLM
+    """
+    # DeepSeek-R1 특성상 `<think>...</think>` 내부 추론 텍스트가 포함될 수 있습니다.
+    # 아래 파서는 단순 문자열만 추출하므로, LLM의 출력을 라인별로 나눠 사용합니다.
+
+    # 질의 확장
+    prompt_perspectives = ChatPromptTemplate.from_template(PERSPECTIVE_TEMPLATE)
+    generate_queries = (
+        prompt_perspectives
+        | ChatOllama(model=model_name, temperature=0.2)
+        | StrOutputParser()
+        | (lambda x: [line.strip() for line in x.split("\n") if line.strip()])
+    )
+
+    # RAG-Fusion 체인
+    retrieval_chain_rag_fusion = generate_queries | ensemble_retriever.map() | reciprocal_rank_fusion
+
+    # 최종 답변 프롬프트
+    FINAL_TEMPLATE = """다음 맥락을 바탕으로 질문에 답변하세요.
+가능하다면 구체적 근거(문장 발췌)와 페이지/절 번호를 함께 제시하고,
+불확실한 부분은 명시하세요.
+
+[맥락]
+{context}
+
+[질문]
+{question}
+"""
+    final_prompt = ChatPromptTemplate.from_template(FINAL_TEMPLATE)
+
+    # 최종 LLM
+    llm = ChatOllama(model=model_name, temperature=0.2)
+
+    # 체인: 컨텍스트 생성 → 프롬프트 → LLM → 문자열
+    final_chain = (
+        {"context": retrieval_chain_rag_fusion | format_docs, "question": RunnablePassthrough()}
+        | final_prompt
+        | llm
+        | StrOutputParser()
+    )
+    return final_chain
+
+# =========================
+# Gradio 상호작용 로직
+# =========================
+def prepare_index(pdf_files: T.List[T.Any], state):
+    """
+    업로드된 Gradio 파일(임시경로 제공)을 받아 인덱스/리트리버 구축.
+    state에 retriever, chain을 저장.
+    """
+    if not pdf_files:
+        return "PDF 파일을 업로드하세요.", state
+
+    # 임시 파일 경로 수집
+    pdf_paths = []
+    temp_dirs = []
+    try:
+        for f in pdf_files:
+            # Gradio는 .name(경로)을 제공합니다. 별도 복사 없이 경로 전달 가능.
+            # 일부 환경에서는 파일을 복사해 안전하게 처리하는 편이 낫습니다.
+            temp_dir = tempfile.TemporaryDirectory()
+            temp_dirs.append(temp_dir)
+            dst = os.path.join(temp_dir.name, os.path.basename(f.name))
+            with open(dst, "wb") as out:
+                out.write(open(f.name, "rb").read())
+            pdf_paths.append(dst)
+
+        # 문서 로드 & 리트리버 구축
+        docs = pdf_to_documents(pdf_paths)
+        ensemble = build_retriever_ensemble(docs)
+        chain = build_rag_chain(ensemble, model_name=state.get("model_name", DEEPSEEK_MODEL))
+
+        # state 저장
+        state["ensemble"] = ensemble
+        state["final_chain"] = chain
+        # temp_dirs를 state에 유지해 세션 종료 시점까지 파일이 존재하도록 함
+        state["_temp_dirs"] = temp_dirs
+
+        return "인덱스 구축 완료 ✅ 이제 질문을 입력하고 ASK를 누르세요.", state
+    except Exception as e:
+        return f"인덱스 구축 중 오류: {e}", state
+
+def ask_question(question: str, state):
+    """
+    사용자의 질문을 받아 최종 RAG 체인으로 답변 생성.
+    """
+    if not question or not question.strip():
+        return "질문을 입력하세요."
+    if "final_chain" not in state or state["final_chain"] is None:
+        return "먼저 PDF를 업로드하고 [인덱스 만들기]를 눌러 인덱스를 구축하세요."
+
+    try:
+        result = state["final_chain"].invoke(question.strip())
+        return result
+    except Exception as e:
+        return f"답변 생성 중 오류: {e}"
+
+def on_model_change(choice: str, state):
+    """
+    모델 선택 변경 시 상태 갱신.
+    """
+    state["model_name"] = choice
+    # 이미 인덱스가 만들어졌다면, 새로운 모델로 체인만 재구성
+    if "ensemble" in state and state["ensemble"] is not None:
+        state["final_chain"] = build_rag_chain(state["ensemble"], model_name=choice)
+        return f"모델을 '{choice}'로 변경했습니다. 바로 질문하실 수 있어요."
+    return f"모델을 '{choice}'로 변경했습니다. 먼저 PDF를 업로드해 인덱스를 만드세요."
+
+# =========================
+# Gradio UI
+# =========================
+with gr.Blocks(title="ChatPDF with MultiQuery + HybridSearch + RAG-Fusion (Ollama/DeepSeek-R1)") as demo:
+    gr.Markdown("## ChatPDF (Local) — MultiQuery · HybridSearch · RAG-Fusion")
+    gr.Markdown(
+        "- **엔진**: Ollama + DeepSeek-R1 (로컬)\n"
+        "- **임베딩**: nomic-embed-text (로컬)\n"
+        "- **검색**: BM25 + FAISS(MMR) 앙상블, Reciprocal Rank Fusion\n"
+        "- **개인정보·비용**: API Key **불필요**, 모든 추론/임베딩이 로컬에서 동작합니다.\n"
+    )
+
+    with gr.Row():
+        model_dropdown = gr.Dropdown(
+            choices=[
+                "deepseek-r1",
+                "deepseek-r1:14b",
+                "deepseek-r1:32b",
+            ],
+            value=DEEPSEEK_MODEL,
+            label="사용할 LLM(DeepSeek-R1) 모델 (Ollama 태그)",
+            interactive=True,
+        )
+
+    with gr.Row():
+        file_input = gr.File(
+            label="PDF 파일 업로드 (복수 선택 가능)",
+            file_count="multiple",
+            file_types=[".pdf"]
+        )
+
+    with gr.Row():
+        build_btn = gr.Button("인덱스 만들기 / 업데이트")
+        build_status = gr.Markdown()
+
+    with gr.Row():
+        question_box = gr.Textbox(label="질문을 입력하세요", placeholder="예) 2장에서 제시한 알고리즘의 시간복잡도는?")
+    with gr.Row():
+        ask_btn = gr.Button("ASK")
+    with gr.Row():
+        answer_out = gr.Markdown()
+
+    # 세션 상태
+    state = gr.State({"model_name": DEEPSEEK_MODEL, "ensemble": None, "final_chain": None})
+
+    # 이벤트 바인딩
+    model_dropdown.change(fn=on_model_change, inputs=[model_dropdown, state], outputs=[build_status])
+    build_btn.click(fn=prepare_index, inputs=[file_input, state], outputs=[build_status, state])
+    ask_btn.click(fn=ask_question, inputs=[question_box, state], outputs=[answer_out])
+
+# 엔트리 포인트
+if __name__ == "__main__":
+    # Gradio 앱 실행
+    demo.launch(server_name="0.0.0.0", server_port=7860)
+
