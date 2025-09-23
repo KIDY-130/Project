@@ -1,0 +1,265 @@
+#65
+"""
+목표: OpenAI 기반 웹 뉴스 RAG 코드를 오픈소스 LLM(DeepSeek-R1) + Ollama + 로컬 임베딩 + Gradio UI로 변환
+
+핵심 전환
+- ChatOpenAI → ChatOllama(model="deepseek-r1")
+- OpenAIEmbeddings → OllamaEmbeddings(model="nomic-embed-text")
+- API Key 제거(로컬 LLM/임베딩 사용)
+- WebBaseLoader + bs4.SoupStrainer로 네이버 경제(101) 섹션 수집
+- Text Splitter: RecursiveCharacterTextSplitter (토큰 인코더 의존 제거)
+- Retriever: Chroma(MMR) + BM25 + EnsembleRetriever
+- MultiQueryRetriever(질문 확장) + RAG-Fusion(RRF)로 강건한 검색
+- Gradio UI 제공
+
+사전 준비(터미널)
+  ollama pull deepseek-r1
+  ollama pull nomic-embed-text
+
+필요 패키지(터미널)
+  pip install -U langchain langchain-community chromadb bs4 gradio
+
+주의
+- 네이버 페이지 구조가 변경되면 SoupStrainer 선택자를 조정해야 합니다.
+- 최초 인덱싱시 네트워크 상태/뉴스량에 따라 시간이 걸릴 수 있습니다.
+"""
+from __future__ import annotations
+import os
+import time
+from typing import List, Dict, Any
+
+# ---------------------- Loader / Parsing ----------------------
+import bs4
+from langchain_community.document_loaders import WebBaseLoader
+
+# ---------------------- Split / VectorStore ----------------------
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import OllamaEmbeddings
+
+# ---------------------- LLM / Retrievers / Chains ----------------------
+from langchain_community.chat_models import ChatOllama
+from langchain.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+
+# ---------------------- UI ----------------------
+import gradio as gr
+
+# ===================== 설정 =====================
+NAVER_ECON_URL = "https://news.naver.com/section/101"  # 경제 섹션
+CHROMA_DIR = "./chroma_news_db"
+LLM_MODEL = "deepseek-r1"
+EMBED_MODEL = "nomic-embed-text"
+
+DEFAULT_K = 1
+DEFAULT_FETCH_K = 4
+
+# 전역
+vectorstore = None
+bm25 = None
+ensemble = None
+retriever_mmr = None
+last_index_time = None
+
+# ===================== 인덱싱 파이프라인 =====================
+
+def load_news_documents():
+    """Naver 경제 섹션 문서를 로드합니다."""
+    loader = WebBaseLoader(
+        web_paths=(NAVER_ECON_URL,),
+        bs_kwargs=dict(
+            parse_only=bs4.SoupStrainer(
+                class_=("sa_text", "sa_item_SECTION_HEADLINE")
+            )
+        ),
+    )
+    return loader.load()
+
+
+def split_documents(docs: List[Any], chunk_size: int = 300, chunk_overlap: int = 50):
+    """문서를 청크로 분할합니다(토큰 인코더 비의존)."""
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", "。", "．", "!", "?", ".", " "]
+    )
+    return splitter.split_documents(docs)
+
+
+def build_vectorstore(splits: List[Any]):
+    """Chroma 벡터스토어를 구성/영속화합니다."""
+    embeddings = OllamaEmbeddings(model=EMBED_MODEL)
+    vs = Chroma.from_documents(documents=splits, embedding=embeddings, persist_directory=CHROMA_DIR)
+    vs.persist()
+    return vs
+
+
+def build_retrievers(splits: List[Any], vs: Chroma, k: int = DEFAULT_K, fetch_k: int = DEFAULT_FETCH_K):
+    """MMR Chroma + BM25 + Ensemble 구성."""
+    chroma_ret = vs.as_retriever(search_type="mmr", search_kwargs={"k": k, "fetch_k": fetch_k})
+    bm25_ret = BM25Retriever.from_documents(splits)
+    bm25_ret.k = max(2, k)
+    ens = EnsembleRetriever(retrievers=[bm25_ret, chroma_ret], weights=[0.2, 0.8])
+    return chroma_ret, bm25_ret, ens
+
+
+def build_index(k: int = DEFAULT_K, fetch_k: int = DEFAULT_FETCH_K, chunk_size: int = 300, chunk_overlap: int = 50):
+    """뉴스 수집 → 분할 → 임베딩/Chroma → 리트리버 구성."""
+    global vectorstore, bm25, ensemble, retriever_mmr, last_index_time
+    docs = load_news_documents()
+    splits = split_documents(docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    vectorstore = build_vectorstore(splits)
+    retriever_mmr, bm25, ensemble = build_retrievers(splits, vectorstore, k=k, fetch_k=fetch_k)
+    last_index_time = time.strftime("%Y-%m-%d %H:%M:%S")
+    return len(docs), len(splits)
+
+
+# ===================== Multi-Query & RRF =====================
+
+def get_multiquery_retriever(base_retriever):
+    """DeepSeek-R1로 다각도 쿼리를 생성해 base_retriever(여기서는 Ensemble)에 적용."""
+    llm = ChatOllama(model=LLM_MODEL, temperature=0.2, num_ctx=4096)
+    prompt = ChatPromptTemplate.from_template(
+        """
+        아래 원본 질문을 의미가 다른 5개 한국어 검색 질문으로 변환하세요.
+        - 각 줄에 검색 질문 1개만 출력
+        - 불필요한 설명 금지
+        원본 질문: {question}
+        """
+    )
+    mq = MultiQueryRetriever.from_llm(retriever=base_retriever, llm=llm, prompt=prompt)
+    return mq
+
+
+def reciprocal_rank_fusion(results: List[List[Any]], k: int = 60, top_n: int = 3, return_docs_only: bool = True):
+    """RRF(Reciprocal Rank Fusion)로 여러 결과 셋을 융합합니다."""
+    from langchain.load import dumps, loads
+    scores: Dict[str, float] = {}
+    for docs in results:
+        for rank, doc in enumerate(docs):
+            key = dumps(doc)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (rank + k)
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
+    fused = [loads(k) for k, _ in ranked]
+    return fused if return_docs_only else ranked
+
+
+# ===================== RAG 체인 =====================
+
+def build_rag_chain(use_multiquery: bool = True, use_rrf: bool = True, rrf_top_n: int = 3):
+    if ensemble is None:
+        raise RuntimeError("인덱스가 아직 생성되지 않았습니다. 먼저 '인덱스 갱신'을 실행하세요.")
+
+    llm = ChatOllama(model=LLM_MODEL, temperature=0.2, num_ctx=4096)
+
+    prompt = ChatPromptTemplate.from_template(
+        """
+        아래는 뉴스 기사에서 추출한 맥락입니다. 한국어로 간결하게 답하세요.
+        필요 시 핵심 근거(기사 요약)와 출처 URL을 함께 제시하세요.
+
+        [맥락]
+        {context}
+
+        [질문]
+        {question}
+        """
+    )
+
+    def format_docs(docs: List[Any]) -> str:
+        blocks = []
+        for d in docs:
+            src = d.metadata.get("source", "")
+            snippet = d.page_content.strip().replace("\n", " ")[:400]
+            blocks.append(f"- 출처: {src}\n  내용: {snippet}")
+        return "\n\n".join(blocks)
+
+    base_retriever = ensemble
+
+    if use_multiquery and use_rrf:
+        # MultiQuery → Ensemble.map → RRF 융합
+        mq = get_multiquery_retriever(base_retriever)
+        retrieval = mq.map() | (lambda results: reciprocal_rank_fusion(results, top_n=rrf_top_n))
+    elif use_multiquery:
+        mq = get_multiquery_retriever(base_retriever)
+        retrieval = mq
+    else:
+        retrieval = base_retriever
+
+    chain = (
+        {"context": retrieval | format_docs, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    return chain
+
+
+# ===================== Gradio UI =====================
+
+def ui_build_index(k: int, fetch_k: int, chunk_size: int, chunk_overlap: int):
+    n_docs, n_splits = build_index(k=int(k), fetch_k=int(fetch_k), chunk_size=int(chunk_size), chunk_overlap=int(chunk_overlap))
+    return f"인덱스 갱신 완료: {last_index_time} / 문서 {n_docs}개 / 청크 {n_splits}개\nMMR(k={k}, fetch_k={fetch_k})"
+
+
+def ui_query(question: str, use_mq: bool, use_rrf: bool, rrf_top_n: int):
+    if not question or not question.strip():
+        return "질문을 입력해주세요.", []
+    chain = build_rag_chain(use_multiquery=bool(use_mq), use_rrf=bool(use_rrf), rrf_top_n=int(rrf_top_n))
+    answer = chain.invoke(question.strip())
+
+    # 참고 문서 프리뷰 (현재 ensemble 기준 상위 3개)
+    docs_preview = ensemble.get_relevant_documents(question)[:3]
+    rows = []
+    for d in docs_preview:
+        rows.append({
+            "source": d.metadata.get("source", ""),
+            "snippet": d.page_content.strip().replace("\n", " ")[:200],
+        })
+    return answer, rows
+
+
+with gr.Blocks(theme=gr.themes.Soft(primary_hue=gr.themes.colors.indigo)) as demo:
+    gr.Markdown("""
+    # 🗞️ Naver 경제 뉴스 RAG (Ollama + DeepSeek-R1)
+    - 오픈소스 LLM/임베딩으로 동작합니다.
+    - **인덱스 갱신** 후 질문을 입력하세요.
+    """)
+
+    with gr.Accordion("인덱싱 설정", open=True):
+        with gr.Row():
+            k = gr.Slider(1, 5, value=DEFAULT_K, step=1, label="MMR k (반환 문서 수)")
+            fetch_k = gr.Slider(1, 12, value=DEFAULT_FETCH_K, step=1, label="MMR fetch_k (고려 문서 수)")
+        with gr.Row():
+            cs = gr.Slider(200, 1200, value=300, step=50, label="chunk_size")
+            co = gr.Slider(0, 300, value=50, step=10, label="chunk_overlap")
+        idx_btn = gr.Button("인덱스 갱신", variant="primary")
+    idx_status = gr.Markdown("인덱스를 먼저 갱신하세요.")
+
+    with gr.Row():
+        q = gr.Textbox(label="질문", placeholder="예) 향후 집값에 대해서 알려줘", lines=2)
+    with gr.Row():
+        use_mq = gr.Checkbox(value=True, label="Multi-Query 사용(질문 확장)")
+        use_rrf = gr.Checkbox(value=True, label="RAG-Fusion(RRF) 융합")
+        rrf_top_n = gr.Slider(1, 5, value=3, step=1, label="RRF 최종 문서 수")
+        ask_btn = gr.Button("질의", variant="primary")
+
+    ans = gr.Markdown(label="답변")
+    table = gr.Dataframe(headers=["source", "snippet"], datatype=["str", "str"], wrap=True, label="참고 문서 (상위 3개)")
+
+    idx_btn.click(fn=ui_build_index, inputs=[k, fetch_k, cs, co], outputs=idx_status)
+    ask_btn.click(fn=ui_query, inputs=[q, use_mq, use_rrf, rrf_top_n], outputs=[ans, table])
+
+
+if __name__ == "__main__":
+    print("[안내] Ollama 모델 준비 상태를 확인하세요:")
+    print("  - LLM: deepseek-r1 (ollama pull deepseek-r1)")
+    print("  - Embedding: nomic-embed-text (ollama pull nomic-embed-text)\n")
+    demo.launch(server_name="0.0.0.0", server_port=7862)
+
+# ollama pull deepseek-r1
+# ollama pull nomic-embed-text
+# !pip install -U langchain langchain-community chromadb bs4 gradio

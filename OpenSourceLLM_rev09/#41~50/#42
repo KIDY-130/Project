@@ -1,0 +1,297 @@
+#42
+"""
+로컬 LLM(Ollama + DeepSeek-R1) 기반 농기구 고장 진단 어시스턴트 (Gradio UI)
+- OpenAI Chat Completions 코드를 오픈소스 LLM 환경으로 변환
+- Gradio UI 제공, JSON 출력 강제, 파싱 안정화, 재시도(최대 3회), 지원 기록 누적
+
+사전 준비:
+  1) Ollama 설치 및 실행 (기본: http://localhost:11434)
+  2) 모델 설치:  `ollama pull deepseek-r1`
+의존성:
+  pip install gradio requests
+
+실행:
+  python app.py
+"""
+
+import re
+import json
+import time
+import requests
+import gradio as gr
+from typing import Dict, List, Optional, Tuple
+
+# -----------------------------
+# Ollama 설정
+# -----------------------------
+OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
+DEFAULT_MODEL = "deepseek-r1"
+
+# -----------------------------
+# 시스템 메세지 템플릿 (원본 유지)
+# -----------------------------
+SYSTEM_MESSAGE_TEMPLATE = """
+
+다음의 전제 지식과 지원 기록을 바탕으로 지원을 해주시기 바랍니다.
+모든 대화에 대한 답변과 그 요약을 다음과 같은 JSON 형식으로 출력해주세요.
+
+## 출력 (JSON 형식)
+{{"content" : "(답변 내용)", "summary" : "(답변 요약 내용)" }}
+
+## 대화의 예
+USER->기계의 상태가 나쁩니다
+AI->{{"content" : "어떤 기계에서 어떤 문제가 발생하고 있습니까?", "summary" : "기계의 종류와 문제 현상을 사용자에게 확인."}}
+
+USER->감사합니다. (종료의 암시, 인사, 감사의 말 등도 포함)
+AI->{{"content" : "천만에요. 언제든지 상담을 요청해 주세요.","summary" : "지원 종료."}}
+
+## 전제 지식
+  - 당신은 농기구 고장 진단의 전문가입니다.
+
+## 지원 기록
+  {support_context}
+
+"""
+
+# -----------------------------
+# JSON 파싱 유틸 (안정성 강화)
+# -----------------------------
+def extract_json(text: str) -> Dict:
+    """
+    모델 출력에서 JSON 객체 한 덩어리만 안정적으로 추출하여 dict로 반환.
+    1) 전체를 그대로 파싱 시도
+    2) 코드블록 ```json ... ``` 또는 ``` ... ``` 감싼 구간 파싱 시도
+    3) 균형 잡힌 중괄호를 이용해 첫 JSON 오브젝트 추출
+    실패 시 JSONDecodeError를 다시 던짐
+    """
+    text = text.strip()
+
+    # 1) 바로 파싱 시도
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 2) 코드블록 내부 파싱 시도
+    fence_patterns = [
+        r"```json\s*(\{.*?\})\s*```",
+        r"```\s*(\{.*?\})\s*```",
+    ]
+    for pat in fence_patterns:
+        m = re.search(pat, text, flags=re.DOTALL)
+        if m:
+            candidate = m.group(1)
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+
+    # 3) 중괄호 균형으로 첫 객체 뽑기
+    start = text.find("{")
+    while start != -1:
+        balance = 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                balance += 1
+            elif text[i] == "}":
+                balance -= 1
+                if balance == 0:
+                    candidate = text[start : i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+        start = text.find("{", start + 1)
+
+    # 모두 실패
+    raise json.JSONDecodeError("Valid JSON object not found", text, 0)
+
+# -----------------------------
+# Ollama 호출
+# -----------------------------
+def ollama_chat(
+    user_text: str,
+    support_context: str,
+    model: str = DEFAULT_MODEL,
+    temperature: float = 0.2,
+    top_p: float = 0.95,
+    num_predict: Optional[int] = None,
+    retry: int = 3,
+    debug: bool = False,
+) -> Tuple[Optional[Dict], str]:
+    """
+    Ollama /api/chat 로 JSON 응답을 유도하고 파싱하여 dict 반환.
+    - 실패 시 최대 retry회 재시도
+    - 반환: (parsed_json_or_none, raw_text)
+    """
+
+    # 시스템 메시지 구성
+    system_msg = SYSTEM_MESSAGE_TEMPLATE.format(support_context=support_context)
+
+    # 사용자 메시지에 JSON 형식 준수 강제
+    user_prompt = (
+        f"JSON 형식으로만 출력해주세요: [{user_text}] + "
+        f"절대 다른 텍스트를 덧붙이지 말고, "
+        f'반드시 정확히 keys "content"와 "summary"만 포함한 JSON 한 개체로만 응답하세요.'
+    )
+
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    options = {"temperature": temperature, "top_p": top_p}
+    if num_predict and num_predict > 0:
+        options["num_predict"] = int(num_predict)
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,  # 여기서는 일괄 응답 후 JSON 파싱
+        "options": options,
+    }
+
+    last_raw = ""
+    for attempt in range(1, retry + 1):
+        try:
+            resp = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=120)
+            resp.raise_for_status()
+            data = resp.json()
+            raw = data.get("message", {}).get("content", "") or ""
+            last_raw = raw
+
+            try:
+                parsed = extract_json(raw)
+                return parsed, raw
+            except json.JSONDecodeError:
+                if debug:
+                    print(f"[JSON 파싱 실패 - {attempt}/{retry}] 원문:\n{raw}\n")
+                # 다음 시도: 모델에 더 강하게 지시하기 위해 user 메시지를 보강
+                payload["messages"][-1]["content"] += (
+                    " 응답 시 JSON 이외의 텍스트(설명/인사/코드블록)는 절대 포함하지 마세요."
+                )
+                time.sleep(0.8)
+                continue
+
+        except requests.RequestException as e:
+            last_raw = f"[연결 오류] Ollama 서버 요청 실패: {e}"
+            if debug:
+                print(last_raw)
+            time.sleep(0.8)
+            continue
+
+    return None, last_raw
+
+# -----------------------------
+# Gradio 핸들러
+# -----------------------------
+def gr_handle(
+    user_text: str,
+    support_context_state: str,
+    model: str,
+    temperature: float,
+    top_p: float,
+    num_predict: Optional[int],
+    debug: bool,
+    chat_log: List[List[str]],
+):
+    """
+    Gradio 이벤트 핸들러
+    - 입력: 사용자 질문 및 현재 support_context
+    - 출력: (답변 content, 요약 summary, 업데이트된 support_context, 채팅 로그)
+    """
+    chat_log = chat_log or []
+    chat_log.append([f"USER: {user_text}", "응답 생성 중..."])
+
+    parsed, raw = ollama_chat(
+        user_text=user_text,
+        support_context=support_context_state,
+        model=model or DEFAULT_MODEL,
+        temperature=temperature,
+        top_p=top_p,
+        num_predict=num_predict,
+        retry=3,
+        debug=debug,
+    )
+
+    if parsed is None:
+        # 파싱 실패 시 raw를 그대로 노출하되, 요약은 동일하게 설정
+        content = raw or "죄송합니다. 요청을 처리하지 못했습니다."
+        summary = content
+        # 지원 기록에는 가능한 한 요약 형태로 축약
+        support_context_state += f"- user: {user_text}\n- AI: {summary}\n\n"
+        chat_log[-1][1] = f"(파싱 실패)\n{content}"
+        return content, summary, support_context_state, chat_log
+
+    # 정상 파싱
+    content = parsed.get("content", "").strip()
+    summary = parsed.get("summary", "").strip()
+
+    # 지원 기록 갱신(원본 코드와 동일한 형식)
+    support_context_state += f"- user: {user_text}\n"
+    support_context_state += f"- AI: {summary}\n\n"
+
+    chat_log[-1][1] = f"CONTENT:\n{content}\n\nSUMMARY:\n{summary}"
+    return content, summary, support_context_state, chat_log
+
+def clear_all():
+    return "", "", "", []
+
+# -----------------------------
+# Gradio UI
+# -----------------------------
+with gr.Blocks(title="농기구 진단 어시스턴트 (DeepSeek-R1 / Ollama)") as demo:
+    gr.Markdown("## 🧑‍🌾 농기구 고장 진단 어시스턴트")
+    gr.Markdown(
+        "- 로컬 **Ollama + DeepSeek-R1** 모델을 사용합니다 (API 키 불필요)\n"
+        "- 응답은 **JSON({content, summary})** 형식으로 강제되어 파싱 후 표시됩니다\n"
+        "- 내부적으로 **지원 기록(support_context)**을 누적하여 문맥을 유지합니다"
+    )
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            with gr.Accordion("⚙️ 설정", open=True):
+                model = gr.Textbox(label="모델명", value=DEFAULT_MODEL)
+                temperature = gr.Slider(0.0, 1.5, value=0.2, step=0.05, label="temperature")
+                top_p = gr.Slider(0.1, 1.0, value=0.95, step=0.05, label="top_p")
+                num_predict = gr.Number(
+                    label="num_predict (최대 생성 토큰 수, 비우면 무제한)",
+                    value=None,
+                    precision=0
+                )
+                debug = gr.Checkbox(label="디버그 출력(콘솔)", value=False)
+                clear_btn = gr.Button("🧹 모두 초기화", variant="secondary")
+
+        with gr.Column(scale=2):
+            user_text = gr.Textbox(
+                label="질문 입력",
+                placeholder="예) 트랙터 시동이 걸리지 않습니다. 배터리는 새것입니다.",
+                lines=3,
+            )
+            ask_btn = gr.Button("질문 전송 🚀", variant="primary")
+
+            with gr.Row():
+                content_out = gr.Textbox(label="답변(content)", lines=8)
+                summary_out = gr.Textbox(label="요약(summary)", lines=8)
+
+            chat_log = gr.Chatbot(label="대화 로그 (원문/요약 동시 표시)", height=400)
+
+    # 상태: 지원 기록 문자열
+    support_context_state = gr.State("")
+
+    ask_btn.click(
+        fn=gr_handle,
+        inputs=[user_text, support_context_state, model, temperature, top_p, num_predict, debug, chat_log],
+        outputs=[content_out, summary_out, support_context_state, chat_log],
+        queue=True,
+    )
+    user_text.submit(
+        fn=gr_handle,
+        inputs=[user_text, support_context_state, model, temperature, top_p, num_predict, debug, chat_log],
+        outputs=[content_out, summary_out, support_context_state, chat_log],
+        queue=True,
+    )
+    clear_btn.click(fn=clear_all, outputs=[content_out, summary_out, support_context_state, chat_log])
+
+if __name__ == "__main__":
+    demo.launch()

@@ -1,0 +1,319 @@
+#63 o
+"""
+목표: 기존 OpenAI 기반 LangChain RAG 코드를 오픈소스 LLM(DeepSeek-R1) + Ollama + Gradio UI 로 변환
+
+필수 조건 반영:
+- API Key (sk-...) 사용 제거
+- 로컬 PC에 Ollama 가 설치되어 있고, deepseek-r1 및 임베딩 모델을 pull 해 사용한다고 가정
+- 벡터스토어: Chroma (로컬 퍼시스턴스)
+- 임베딩: OllamaEmbeddings (예: nomic-embed-text)
+- LLM: ChatOllama(model="deepseek-r1")
+- 웹 로더: WebBaseLoader 로 Naver 경제(101) 섹션 수집
+- 텍스트 분할: RecursiveCharacterTextSplitter (토큰 인코더 의존 제거)
+- 검색: MMR 기반 검색
+- Multi-Query(질문 확장) + RAG 체인
+- Gradio 로 간단한 UI 제공 (인덱스 갱신 버튼 / 질문 입력 / 옵션)
+
+사전 준비(터미널):
+  ollama pull deepseek-r1
+  ollama pull nomic-embed-text
+
+필요 패키지(터미널):
+  pip install -U langchain langchain-community chromadb bs4 gradio
+
+주의:
+- Naver 페이지 구조가 바뀌면 SoupStrainer 선택자(class_)를 조정해야 할 수 있습니다.
+- 처음 인덱싱 시 뉴스 양/연결 상태에 따라 시간이 소요될 수 있습니다.
+"""
+
+from __future__ import annotations
+import os
+import time
+from typing import List, Dict, Any
+
+# --- Web 수집/파싱 ---
+import bs4
+from langchain_community.document_loaders import WebBaseLoader
+
+# --- 분할/벡터스토어 ---
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import OllamaEmbeddings
+
+# --- LLM / 체인 구성 ---
+from langchain_community.chat_models import ChatOllama
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain.prompts import ChatPromptTemplate
+
+# --- UI ---
+import gradio as gr
+
+# =============================================
+# 설정값
+# =============================================
+NAVER_ECON_URL = "https://news.naver.com/section/101"  # 경제 섹션
+CHROMA_DIR = "./chroma_db"
+EMBED_MODEL = "nomic-embed-text"  # ollama 임베딩 모델
+LLM_MODEL = "deepseek-r1"         # ollama LLM 모델
+
+# 기본 검색 파라미터(MMR)
+DEFAULT_K = 1
+DEFAULT_FETCH_K = 4
+
+# 전역 상태 (간단 관리)
+vectorstore = None
+retriever = None
+last_index_time = None
+
+# =============================================
+# 1) 인덱싱 파이프라인
+# =============================================
+
+def load_news_documents() -> List[Any]:
+    """Naver 경제 섹션에서 문서 수집.
+    SoupStrainer 로 필요한 블록만 파싱하여 속도 ↑
+    """
+    loader = WebBaseLoader(
+        web_paths=(NAVER_ECON_URL,),
+        bs_kwargs=dict(
+            parse_only=bs4.SoupStrainer(
+                class_=("sa_text", "sa_item_SECTION_HEADLINE")
+            )
+        ),
+    )
+    docs = loader.load()
+    return docs
+
+
+def split_documents(docs: List[Any]) -> List[Any]:
+    """문서 분할.
+    - 토큰 기반 인코더에 의존하지 않고, 문자 단위 분할로 단순/견고하게 구성.
+    - 한국어 뉴스 기준으로 300자/50자 겹침이 무난.
+    """
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=300,
+        chunk_overlap=50,
+        separators=["\n\n", "\n", "。", "．", "!", "?", ".", " "]
+    )
+    return splitter.split_documents(docs)
+
+
+def build_vectorstore(splits: List[Any]) -> Chroma:
+    """Chroma 벡터스토어 생성 및 로컬에 지속화.
+    OllamaEmbeddings 를 사용하여 오픈소스 임베딩으로 전환.
+    """
+    embeddings = OllamaEmbeddings(model=EMBED_MODEL)
+    vs = Chroma.from_documents(
+        documents=splits,
+        embedding=embeddings,
+        persist_directory=CHROMA_DIR,
+    )
+    vs.persist()
+    return vs
+
+
+def build_retriever(vs: Chroma, k: int = DEFAULT_K, fetch_k: int = DEFAULT_FETCH_K):
+    """MMR 기반 retriever 구성."""
+    return vs.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": k, "fetch_k": fetch_k},
+    )
+
+
+def build_index(k: int = DEFAULT_K, fetch_k: int = DEFAULT_FETCH_K):
+    """전체 인덱싱 파이프라인 수행.
+    - 뉴스 수집 → 분할 → Chroma 구축 → Retriever 구성
+    """
+    global vectorstore, retriever, last_index_time
+
+    docs = load_news_documents()
+    splits = split_documents(docs)
+    vectorstore = build_vectorstore(splits)
+    retriever = build_retriever(vectorstore, k=k, fetch_k=fetch_k)
+    last_index_time = time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+# =============================================
+# 2) Multi-Query (질문 확장) 구성
+# =============================================
+
+def get_multiquery_generator():
+    """사용자 질문을 다각도로 확장하는 LLM 체인.
+    DeepSeek-R1 을 사용하며, 출력은 줄바꿈으로 분리된 5개 변형 쿼리.
+    """
+    template = (
+        """
+        당신은 숙련된 검색어 생성기입니다. 아래 원본 질문과 주제 맥락을 바탕으로,
+        벡터 검색 적합도가 높도록 의미가 서로 다른 5개의 한국어 검색 쿼리를 생성하세요.
+        - 각각 한 줄로 출력
+        - 불필요한 설명 금지(검색어만)
+        원본 질문: {question}
+        """
+    )
+    prompt = ChatPromptTemplate.from_template(template)
+
+    llm = ChatOllama(
+        model=LLM_MODEL,
+        temperature=0.2,
+        # DeepSeek-R1 은 사유(Chain-of-Thought)를 장황히 생성할 수 있어 지시로 간결 출력 유도
+        num_ctx=4096,
+    )
+
+    generate_queries = (
+        prompt
+        | llm
+        | StrOutputParser()
+        | (lambda x: [q.strip() for q in x.split("\n") if q.strip()])
+    )
+    return generate_queries
+
+
+def get_unique_union(documents: List[List[Any]]) -> List[Any]:
+    """검색 결과(리스트의 리스트)의 중복 제거 합집합.
+    LangChain 문서 객체는 해시가 어려워 문자열 직렬화로 중복 제거.
+    """
+    from langchain.load import dumps, loads
+
+    flattened = [dumps(doc) for sublist in documents for doc in sublist]
+    unique = list(set(flattened))
+    return [loads(s) for s in unique]
+
+
+# =============================================
+# 3) RAG 체인 생성
+# =============================================
+
+def get_rag_chain(use_multiquery: bool = True):
+    """Retriever + (옵션)Multi-Query + LLM 을 묶어 최종 답변 체인 구성."""
+    if retriever is None:
+        raise RuntimeError("인덱스가 아직 생성되지 않았습니다. 먼저 '인덱스 갱신'을 실행하세요.")
+
+    # 답변 프롬프트 (간결, 출처 요약 포함)
+    template = (
+        """
+        다음은 뉴스 기사에서 추출한 맥락입니다. 한국어로 정확하고 간결하게 답하세요.
+        필요시 핵심 근거(기사 요약)와 출처 URL을 함께 제시하세요.
+
+        [맥락]
+        {context}
+
+        [질문]
+        {question}
+        """
+    )
+    prompt = ChatPromptTemplate.from_template(template)
+
+    llm = ChatOllama(
+        model=LLM_MODEL,
+        temperature=0.2,
+        num_ctx=4096,
+    )
+
+    def format_docs(docs: List[Any]) -> str:
+        """문서들을 하나의 큰 문자열로 포맷.
+        각 조각의 출처 URL(가능하면)과 앞부분 요약 포함.
+        """
+        blocks = []
+        for d in docs:
+            src = d.metadata.get("source", "")
+            snippet = d.page_content.strip().replace("\n", " ")[:400]
+            blocks.append(f"- 출처: {src}\n  내용: {snippet}")
+        return "\n\n".join(blocks)
+
+    if use_multiquery:
+        # Multi-Query 체인: 질문 → 5개 변형 → 각각 검색 → 합집합
+        generate_queries = get_multiquery_generator()
+        retrieval_chain = generate_queries | retriever.map() | get_unique_union
+        rag_chain = (
+            {"context": retrieval_chain | format_docs, "question": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
+    else:
+        # 단일 쿼리 RAG
+        rag_chain = (
+            {"context": retriever | format_docs, "question": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
+
+    return rag_chain
+
+
+# =============================================
+# 4) Gradio UI 콜백
+# =============================================
+
+def ui_build_index(k: int, fetch_k: int):
+    """인덱스 갱신 버튼 콜백."""
+    build_index(k=k, fetch_k=fetch_k)
+    return f"인덱스 갱신 완료: {last_index_time} (k={k}, fetch_k={fetch_k})"
+
+
+def ui_query(question: str, use_multiquery: bool):
+    """질의 버튼 콜백."""
+    if not question or len(question.strip()) == 0:
+        return "질문을 입력해주세요.", []
+
+    chain = get_rag_chain(use_multiquery=use_multiquery)
+    answer = chain.invoke(question.strip())
+
+    # 프리뷰용으로 현재 retriever 기준 top 문서도 보여준다
+    docs_preview = retriever.get_relevant_documents(question) if retriever else []
+    rows = []
+    for d in docs_preview:
+        rows.append({
+            "source": d.metadata.get("source", ""),
+            "snippet": d.page_content.strip().replace("\n", " ")[:200],
+        })
+    return answer, rows
+
+
+# =============================================
+# 5) Gradio App
+# =============================================
+with gr.Blocks(theme=gr.themes.Soft(primary_hue=gr.themes.colors.green)) as demo:
+    gr.Markdown("""
+    # 🔎 Naver 경제 뉴스 RAG (Ollama + DeepSeek-R1)
+    - 오픈소스 LLM(DeepSeek-R1)과 로컬 임베딩으로 동작합니다.
+    - **인덱스 갱신** 후 질문을 입력하세요.
+    """)
+
+    with gr.Row():
+        k = gr.Slider(1, 5, value=DEFAULT_K, step=1, label="k (최종 반환 문서 수)")
+        fetch_k = gr.Slider(1, 10, value=DEFAULT_FETCH_K, step=1, label="fetch_k (MMR 고려 문서 수)")
+        idx_btn = gr.Button("인덱스 갱신", variant="primary")
+
+    idx_status = gr.Markdown("인덱스가 아직 생성되지 않았습니다.")
+
+    with gr.Row():
+        q = gr.Textbox(label="질문 입력", placeholder="예) 국채 동향 요약해줘 / 집값 전망은?", lines=2)
+    with gr.Row():
+        use_mq = gr.Checkbox(value=True, label="Multi-Query 사용(질문 확장)")
+        ask_btn = gr.Button("질의", variant="primary")
+
+    ans = gr.Markdown(label="답변")
+    table = gr.Dataframe(headers=["source", "snippet"], datatype=["str", "str"], wrap=True, label="참고 문서 (미리보기)")
+
+    idx_btn.click(fn=ui_build_index, inputs=[k, fetch_k], outputs=idx_status)
+    ask_btn.click(fn=ui_query, inputs=[q, use_mq], outputs=[ans, table])
+
+
+if __name__ == "__main__":
+    # 최초 실행 시 임베딩/LLM 모델 미리 안내
+    print("[안내] Ollama 에서 다음 모델이 준비되어 있어야 합니다:")
+    print("  - LLM: deepseek-r1   (ollama pull deepseek-r1)")
+    print("  - Embedding: nomic-embed-text (ollama pull nomic-embed-text)\n")
+
+    # 앱 실행
+    demo.launch(server_name="0.0.0.0", server_port=7860)
+
+
+# ollama pull deepseek-r1
+# ollama pull nomic-embed-text
+# pip install -U langchain langchain-community chromadb bs4 gradio
+
+

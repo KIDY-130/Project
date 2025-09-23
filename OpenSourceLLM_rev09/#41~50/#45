@@ -1,0 +1,550 @@
+
+#45
+"""
+LlamaIndex + Ollama (DeepSeek-R1) RAG 데모 - 하이브리드 검색(BM25+벡터) + Reranker + 섹션/목차 기반 청킹 + 출처 노출
+
+요약
+- 로컬 LLM/임베딩: Ollama(DeepSeek-R1, nomic-embed-text)
+- 하이브리드 검색: 벡터 검색 + BM25(전통적 단어기반) 결과를 가중 병합
+- Reranker: Sentence-Transformers 교차 인코더로 상위 문서 재랭킹
+- 청킹 최적화: Markdown/섹션(헤딩) 기준으로 나눈 뒤 문장 단위 세분화(중첩/오버랩)
+- 출처 노출: 응답 하단에 소스 노드(파일/URL/섹션/스코어) 리스트 표시
+- Gradio UI 포함
+
+사전 준비
+1) Ollama 설치 및 실행 (http://localhost:11434)
+   - 언어모델:  `ollama pull deepseek-r1`
+   - 임베딩:    `ollama pull nomic-embed-text`
+2) 패키지 설치
+   pip install "llama-index>=0.10.0" llama-index-llms-ollama llama-index-embeddings-ollama \
+               gradio requests pypdf beautifulsoup4 sentence-transformers
+
+실행
+  python app.py
+"""
+from __future__ import annotations
+import math
+from pathlib import Path
+from typing import List, Optional, Dict, Iterable
+
+import gradio as gr
+
+# LlamaIndex 핵심
+from llama_index.core import (
+    VectorStoreIndex,
+    SimpleDirectoryReader,
+    StorageContext,
+    load_index_from_storage,
+    Settings,
+)
+from llama_index.core.base.base_retriever import BaseRetriever
+from llama_index.core.schema import NodeWithScore, QueryBundle
+from llama_index.core.retrievers import RecursiveRetriever
+from llama_index.core.response_synthesizers import get_response_synthesizer
+
+# LLM/임베딩: Ollama
+from llama_index.llms.ollama import Ollama
+from llama_index.embeddings.ollama import OllamaEmbedding
+
+# 로더
+from llama_index.readers.web import BeautifulSoupWebReader
+
+# 청킹/파서
+from llama_index.core.node_parser import MarkdownNodeParser, SentenceSplitter
+
+# Reranker (버전 호환 임포트)
+SentenceTransformerRerank = None
+try:
+    from llama_index.postprocessor.sentence_transformer_rerank import SentenceTransformerRerank  # type: ignore
+except Exception:
+    try:
+        from llama_index.postprocessor.sbert_rerank import SentenceTransformerRerank  # type: ignore
+    except Exception:
+        SentenceTransformerRerank = None
+
+# BM25 (버전 호환 임포트)
+BM25RetrieverClass = None
+try:
+    from llama_index.core.retrievers import BM25Retriever as _BM25
+    BM25RetrieverClass = _BM25
+except Exception:
+    try:
+        from llama_index.retrievers.bm25 import BM25Retriever as _BM25  # type: ignore
+        BM25RetrieverClass = _BM25
+    except Exception:
+        BM25RetrieverClass = None
+
+# ---------------------------
+# 전역 설정: 로컬 LLM + 임베딩
+# ---------------------------
+DEFAULT_LLM_MODEL = "deepseek-r1"
+DEFAULT_EMBED_MODEL = "nomic-embed-text"
+
+
+def configure_llamaindex(
+    llm_model: str = DEFAULT_LLM_MODEL,
+    embed_model: str = DEFAULT_EMBED_MODEL,
+    temperature: float = 0.2,
+    top_p: float = 0.95,
+):
+    """LlamaIndex 전역 Settings에 로컬 Ollama LLM/임베딩 등록."""
+    Settings.llm = Ollama(
+        model=llm_model,
+        request_timeout=120,
+        temperature=temperature,
+        top_p=top_p,
+    )
+    Settings.embed_model = OllamaEmbedding(model_name=embed_model)
+
+
+# ---------------------------
+# 청킹(섹션/문장 기반) 파이프라인
+# ---------------------------
+
+def build_chunking_pipeline(
+    use_markdown_section: bool = True,
+    sentence_chunk_size: int = 800,
+    sentence_chunk_overlap: int = 160,
+):
+    """Markdown 섹션 파서 + 문장 분할기 구성.
+    - MarkdownNodeParser: 헤딩(##, ###, …) 기준 섹션 노드 생성
+    - SentenceSplitter: 섹션 내부를 문장 단위로 세분화 (중첩/오버랩 지원)
+    """
+    parsers: List = []
+    if use_markdown_section:
+        # 섹션(헤딩) 단위 노드 생성: 메타데이터에 섹션 제목, 경로가 포함됨
+        parsers.append(MarkdownNodeParser())
+    # 문장 분할기: 길이 기반 청킹, 오버랩으로 문맥 보존
+    parsers.append(
+        SentenceSplitter(
+            chunk_size=sentence_chunk_size,
+            chunk_overlap=sentence_chunk_overlap,
+        )
+    )
+    return parsers
+
+
+# ---------------------------
+# 색인 저장/불러오기
+# ---------------------------
+
+def build_index_from_documents(documents, persist_dir: str, transformations: Optional[List] = None) -> VectorStoreIndex:
+    index = VectorStoreIndex.from_documents(documents, transformations=transformations)
+    index.storage_context.persist(persist_dir=persist_dir)
+    return index
+
+
+def load_index(persist_dir: str) -> VectorStoreIndex:
+    storage_context = StorageContext.from_defaults(persist_dir=persist_dir)
+    return load_index_from_storage(storage_context)
+
+
+# ---------------------------
+# 데이터 소스별 색인 생성
+# ---------------------------
+
+def index_local_folder(folder_path: str, persist_dir: str,
+                       use_md_section: bool, chunk_size: int, chunk_overlap: int) -> str:
+    folder = Path(folder_path)
+    if not folder.exists() or not folder.is_dir():
+        return f"[오류] 폴더를 찾을 수 없습니다: {folder_path}"
+
+    documents = SimpleDirectoryReader(folder_path).load_data()
+    transformations = build_chunking_pipeline(use_md_section, chunk_size, chunk_overlap)
+    index = build_index_from_documents(documents, persist_dir, transformations)
+    _ = index.as_query_engine()  # 엔진 생성으로 간단 검증
+    return f"[완료] 폴더 색인 생성 및 저장: {persist_dir} (문서 수: {len(documents)})"
+
+
+def index_web_urls(urls_text: str, persist_dir: str,
+                   use_md_section: bool, chunk_size: int, chunk_overlap: int) -> str:
+    urls: List[str] = []
+    for token in urls_text.replace(",", "\n").splitlines():
+        u = token.strip()
+        if u:
+            urls.append(u)
+    if not urls:
+        return "[오류] 유효한 URL이 없습니다."
+
+    loader = BeautifulSoupWebReader()
+    documents = loader.load_data(urls=urls)
+    transformations = build_chunking_pipeline(use_md_section, chunk_size, chunk_overlap)
+    index = build_index_from_documents(documents, persist_dir, transformations)
+    _ = index.as_query_engine()
+    return f"[완료] 웹 문서 색인 생성 및 저장: {persist_dir} (문서 수: {len(documents)})"
+
+
+def index_pdf_files(file_paths_text: str, persist_dir: str,
+                    use_md_section: bool, chunk_size: int, chunk_overlap: int) -> str:
+    paths: List[Path] = []
+    for token in file_paths_text.replace(",", "\n").splitlines():
+        p = Path(token.strip())
+        if p.exists() and p.is_file() and p.suffix.lower() == ".pdf":
+            paths.append(p)
+    if not paths:
+        return "[오류] 유효한 PDF 파일 경로가 없습니다."
+
+    documents = SimpleDirectoryReader(input_files=paths).load_data()
+    transformations = build_chunking_pipeline(use_md_section, chunk_size, chunk_overlap)
+    index = build_index_from_documents(documents, persist_dir, transformations)
+    _ = index.as_query_engine()
+    return f"[완료] PDF 색인 생성 및 저장: {persist_dir} (문서 수: {len(documents)})"
+
+
+# ---------------------------
+# 하이브리드 검색 (벡터 + BM25) + Reranker
+# ---------------------------
+class HybridRetriever(BaseRetriever):
+    """벡터 검색과 BM25 결과를 가중 병합하는 커스텀 리트리버.
+
+    - vector_weight(alpha): 0~1 사이. 최종 스코어 = alpha*vector + (1-alpha)*bm25
+    - 각 결과의 점수는 0~1로 정규화(min-max)하여 결합
+    - BM25Retriever는 LlamaIndex 내장 클래스를 사용(버전 호환 처리)
+    """
+
+    def __init__(
+        self,
+        index: VectorStoreIndex,
+        vector_top_k: int = 8,
+        bm25_top_k: int = 16,
+        alpha: float = 0.5,
+    ) -> None:
+        super().__init__()
+        self.index = index
+        self.vector_top_k = vector_top_k
+        self.bm25_top_k = bm25_top_k
+        self.alpha = max(0.0, min(1.0, alpha))
+
+        # 벡터 리트리버
+        self.vector_retriever = index.as_retriever(similarity_top_k=self.vector_top_k)
+
+        # BM25 리트리버 (가능한 경우 인덱스에서 직접 생성)
+        self.bm25_retriever = None
+        if BM25RetrieverClass is not None:
+            try:
+                # 일부 버전은 from_defaults(index=index) 지원
+                self.bm25_retriever = BM25RetrieverClass.from_defaults(
+                    index=index, similarity_top_k=self.bm25_top_k
+                )
+            except Exception:
+                try:
+                    # 대안: 모든 노드를 수집해서 구성(저장소에서 노드 로드)
+                    nodes = list(index.docstore.get_all_nodes().values())
+                    self.bm25_retriever = BM25RetrieverClass.from_defaults(
+                        nodes=nodes, similarity_top_k=self.bm25_top_k
+                    )
+                except Exception:
+                    self.bm25_retriever = None
+
+    def _retrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
+        # 1) 벡터 검색
+        v_nodes = self.vector_retriever.retrieve(query_bundle)
+
+        # 2) BM25 검색 (가능한 경우)
+        b_nodes: List[NodeWithScore] = []
+        if self.bm25_retriever is not None:
+            b_nodes = self.bm25_retriever.retrieve(query_bundle)
+
+        # 3) 점수 정규화 + 병합
+        def normalize(nodes: List[NodeWithScore]) -> Dict[str, float]:
+            if not nodes:
+                return {}
+            scores = [n.score for n in nodes if n.score is not None]
+            if not scores:
+                return {}
+            s_min, s_max = min(scores), max(scores)
+            denom = (s_max - s_min) if (s_max - s_min) > 1e-9 else 1.0
+            norm = {}
+            for n in nodes:
+                s = n.score if n.score is not None else s_min
+                norm[str(n.node.node_id)] = (s - s_min) / denom
+            return norm
+
+        v_map = normalize(v_nodes)
+        b_map = normalize(b_nodes)
+
+        # id -> NodeWithScore (원본 노드 보관)
+        id2node: Dict[str, NodeWithScore] = {}
+        for n in v_nodes + b_nodes:
+            id2node[str(n.node.node_id)] = n
+
+        # 결합 스코어 계산
+        combined: List[NodeWithScore] = []
+        keys = set(v_map.keys()) | set(b_map.keys())
+        for k in keys:
+            v = v_map.get(k, 0.0)
+            b = b_map.get(k, 0.0)
+            score = self.alpha * v + (1.0 - self.alpha) * b
+            node = id2node[k]
+            combined.append(NodeWithScore(node=node.node, score=score))
+
+        # 스코어 내림차순 정렬
+        combined.sort(key=lambda x: x.score or 0.0, reverse=True)
+        return combined
+
+
+def make_query_engine(
+    index: VectorStoreIndex,
+    response_mode: str = "default",
+    vector_top_k: int = 8,
+    bm25_top_k: int = 16,
+    alpha: float = 0.5,
+    use_reranker: bool = True,
+    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    rerank_top_n: int = 4,
+):
+    # 하이브리드 리트리버
+    retriever = HybridRetriever(
+        index=index,
+        vector_top_k=vector_top_k,
+        bm25_top_k=bm25_top_k,
+        alpha=alpha,
+    )
+
+    # 노드 후처리기 (Reranker)
+    node_postprocessors = []
+    if use_reranker:
+        if SentenceTransformerRerank is None:
+            raise RuntimeError(
+                "SentenceTransformerRerank 임포트 실패. 'sentence-transformers' 및 LlamaIndex 버전을 확인하세요."
+            )
+        node_postprocessors.append(
+            SentenceTransformerRerank(top_n=rerank_top_n, model=rerank_model)
+        )
+
+    # 응답 합성기
+    synthesizer = get_response_synthesizer(response_mode=response_mode)
+
+    # Query Engine 조립(RecursiveRetriever 래퍼 사용해도 되지만 여기선 직접 처리)
+    class _QE:
+        def __init__(self, retriever: BaseRetriever):
+            self.retriever = retriever
+        def query(self, q: str):
+            qb = QueryBundle(q)
+            nodes = self.retriever.retrieve(qb)
+            # 후처리 적용
+            processed = nodes
+            for pp in node_postprocessors:
+                processed = pp.postprocess_nodes(processed, qb)
+            # 응답 생성
+            resp = synthesizer.synthesize(
+                query=qb,
+                nodes=processed,
+            )
+            # 소스 노드를 붙여서 반환(문자열 + 출처 목록)
+            lines = [str(resp)]
+            lines.append("\n\n---\n### 🔎 Sources")
+            for i, sn in enumerate(resp.source_nodes, 1):
+                meta = sn.node.metadata or {}
+                file = meta.get("file_name") or meta.get("filename") or meta.get("source") or "-"
+                url = meta.get("url") or meta.get("URL") or ""
+                sect = meta.get("section") or meta.get("Category") or meta.get("title") or ""
+                score = sn.score if sn.score is not None else 0.0
+                item = f"{i}. score={score:.3f} | file={file}"
+                if sect:
+                    item += f" | section={sect}"
+                if url:
+                    item += f" | url={url}"
+                lines.append(item)
+            return "\n".join(lines)
+
+    return _QE(retriever)
+
+
+# ---------------------------
+# 질의 핸들러 (UI)
+# ---------------------------
+
+def query_index(
+    persist_dir: str,
+    user_query: str,
+    response_mode: str,
+    vector_top_k: int,
+    bm25_top_k: int,
+    alpha: float,
+    use_reranker: bool,
+    rerank_model: str,
+    rerank_top_n: int,
+) -> str:
+    if not user_query.strip():
+        return "[오류] 질의 내용을 입력하세요."
+    try:
+        index = load_index(persist_dir)
+    except Exception as e:
+        return f"[오류] 색인을 불러올 수 없습니다. 먼저 색인을 생성하세요.\n- persist_dir: {persist_dir}\n- 상세: {e}"
+
+    try:
+        qe = make_query_engine(
+            index=index,
+            response_mode=response_mode,
+            vector_top_k=int(vector_top_k),
+            bm25_top_k=int(bm25_top_k),
+            alpha=float(alpha),
+            use_reranker=bool(use_reranker),
+            rerank_model=rerank_model.strip(),
+            rerank_top_n=int(rerank_top_n),
+        )
+    except Exception as e:
+        return f"[오류] Query Engine 생성 실패: {e}"
+
+    return qe.query(user_query)
+
+
+# ---------------------------
+# Gradio UI
+# ---------------------------
+with gr.Blocks(title="LlamaIndex + Ollama (RAG 하이브리드/Rerank/섹션 청킹/출처)") as demo:
+    gr.Markdown("## 🔎 LlamaIndex + Ollama RAG — 하이브리드 검색(BM25+벡터) + Reranker + 섹션 청킹 + 출처 노출")
+    gr.Markdown(
+        "- 로컬 **Ollama LLM/임베딩**\n"
+        "- **섹션 기반 청킹**(Markdown 헤딩) + 문장 단위 청킹으로 문맥 보존\n"
+        "- **하이브리드 검색**: 벡터 + BM25 가중 병합(alpha로 조절)\n"
+        "- **Reranker**: 교차 인코더로 상위 문서 재정렬\n"
+        "- 응답 하단에 **출처(Source Nodes)** 자동 표시"
+    )
+
+    # 전역 모델 설정
+    with gr.Accordion("⚙️ 전역 LLM/임베딩 설정 (Ollama)", open=True):
+        with gr.Row():
+            llm_model = gr.Textbox(label="LLM 모델", value=DEFAULT_LLM_MODEL, scale=2)
+            embed_model = gr.Textbox(label="임베딩 모델", value=DEFAULT_EMBED_MODEL, scale=2)
+        with gr.Row():
+            temperature = gr.Slider(0.0, 1.5, value=0.2, step=0.05, label="temperature", scale=1)
+            top_p = gr.Slider(0.1, 1.0, value=0.95, step=0.05, label="top_p", scale=1)
+        apply_btn = gr.Button("모델 설정 적용", variant="primary")
+        apply_status = gr.Markdown(visible=True)
+
+    # 색인 생성 탭
+    with gr.Tabs():
+        with gr.Tab("📁 폴더 색인"):
+            with gr.Row():
+                folder_path = gr.Textbox(label="폴더 경로", value="data", scale=3)
+                persist_dir_folder = gr.Textbox(label="저장 경로(persist_dir)", value="storage_folder", scale=2)
+            with gr.Row():
+                use_md_section = gr.Checkbox(label="Markdown 섹션(헤딩) 기반 분해 사용", value=True)
+                chunk_size = gr.Slider(200, 2000, value=800, step=50, label="문장 청킹 크기")
+                chunk_overlap = gr.Slider(0, 400, value=160, step=10, label="오버랩")
+            build_folder_btn = gr.Button("폴더 색인 생성/저장", variant="primary")
+            folder_status = gr.Textbox(label="상태", lines=3)
+
+        with gr.Tab("🌐 웹 URL 색인"):
+            urls_text = gr.Textbox(
+                label="URL 목록 (쉼표/줄바꿈 구분)",
+                placeholder="예) https://www.law.go.kr/법령/대한민국헌법",
+                lines=3,
+            )
+            with gr.Row():
+                persist_dir_web = gr.Textbox(label="저장 경로(persist_dir)", value="storage_web")
+                use_md_section_w = gr.Checkbox(label="Markdown 섹션 분해", value=True)
+                chunk_size_w = gr.Slider(200, 2000, value=800, step=50, label="문장 청킹 크기")
+                chunk_overlap_w = gr.Slider(0, 400, value=160, step=10, label="오버랩")
+            build_web_btn = gr.Button("웹 색인 생성/저장", variant="primary")
+            web_status = gr.Textbox(label="상태", lines=3)
+
+        with gr.Tab("📄 PDF 색인"):
+            pdf_paths_text = gr.Textbox(
+                label="PDF 경로 목록 (쉼표/줄바꿈 구분)",
+                placeholder="예) ./attention.pdf",
+                lines=3,
+            )
+            with gr.Row():
+                persist_dir_pdf = gr.Textbox(label="저장 경로(persist_dir)", value="storage_pdf")
+                use_md_section_p = gr.Checkbox(label="Markdown 섹션 분해", value=True)
+                chunk_size_p = gr.Slider(200, 2000, value=800, step=50, label="문장 청킹 크기")
+                chunk_overlap_p = gr.Slider(0, 400, value=160, step=10, label="오버랩")
+            build_pdf_btn = gr.Button("PDF 색인 생성/저장", variant="primary")
+            pdf_status = gr.Textbox(label="상태", lines=3)
+
+    # 질의 + 하이브리드/Rerank 설정
+    gr.Markdown("---")
+    gr.Markdown("### 💬 질의하기 (저장된 색인 대상) — 하이브리드 & Reranker")
+    with gr.Row():
+        persist_dir_query = gr.Textbox(label="대상 persist_dir", value="storage_folder", scale=2)
+        response_mode = gr.Dropdown(
+            ["default", "compact", "tree_summarize", "accumulate"],
+            value="default",
+            label="response_mode",
+            scale=1,
+        )
+    with gr.Row():
+        vector_top_k = gr.Slider(1, 50, value=8, step=1, label="벡터 Top-K")
+        bm25_top_k = gr.Slider(1, 100, value=16, step=1, label="BM25 Top-K")
+        alpha = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="가중치 α (벡터 비중)")
+    with gr.Row():
+        use_reranker = gr.Checkbox(label="Reranker 사용", value=True)
+        rerank_model = gr.Textbox(
+            label="Reranker 모델 (Sentence-Transformers)",
+            value="cross-encoder/ms-marco-MiniLM-L-6-v2",
+            placeholder="예) cross-encoder/ms-marco-MiniLM-L-6-v2, BAAI/bge-reranker-base",
+        )
+        rerank_top_n = gr.Slider(1, 50, value=4, step=1, label="Rerank Top-N")
+
+    user_query = gr.Textbox(
+        label="질의",
+        placeholder="예) What did the author do growing up? / 한국어로 요약해줘",
+        lines=2,
+    )
+    ask_btn = gr.Button("질의 실행 🚀", variant="primary")
+    answer_box = gr.Textbox(label="응답 + 출처", lines=14)
+
+    # 이벤트 바인딩
+    def _apply_models(llm, emb, temp, tp):
+        configure_llamaindex(llm, emb, temp, tp)
+        return gr.update(value=f"✅ 적용됨: LLM={llm}, EMB={emb}, temperature={temp}, top_p={tp}")
+
+    apply_btn.click(
+        fn=_apply_models,
+        inputs=[llm_model, embed_model, temperature, top_p],
+        outputs=[apply_status],
+    )
+
+    build_folder_btn.click(
+        fn=index_local_folder,
+        inputs=[folder_path, persist_dir_folder, use_md_section, chunk_size, chunk_overlap],
+        outputs=[folder_status],
+    )
+
+    build_web_btn.click(
+        fn=index_web_urls,
+        inputs=[urls_text, persist_dir_web, use_md_section_w, chunk_size_w, chunk_overlap_w],
+        outputs=[web_status],
+    )
+
+    build_pdf_btn.click(
+        fn=index_pdf_files,
+        inputs=[pdf_paths_text, persist_dir_pdf, use_md_section_p, chunk_size_p, chunk_overlap_p],
+        outputs=[pdf_status],
+    )
+
+    ask_btn.click(
+        fn=query_index,
+        inputs=[
+            persist_dir_query,
+            user_query,
+            response_mode,
+            vector_top_k,
+            bm25_top_k,
+            alpha,
+            use_reranker,
+            rerank_model,
+            rerank_top_n,
+        ],
+        outputs=[answer_box],
+    )
+
+# 최초 1회 전역 모델 설정
+configure_llamaindex()
+
+if __name__ == "__main__":
+    demo.launch()
+
+
+
+
+
+
+# ollama pull deepseek-r1
+# ollama pull nomic-embed-text
+# pip install "llama-index>=0.10.0" llama-index-llms-ollama
+# llama-index-embeddings-ollama \ gradio requests pypdf beautifulsoup4 
+# sentence-transformers

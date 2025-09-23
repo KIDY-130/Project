@@ -1,0 +1,124 @@
+#52
+# ============================================================
+# Gradio UI for Ollama (DeepSeek-R1) using LangChain
+# ------------------------------------------------------------
+# ✅ 완전 로컬: OpenAI API Key 불필요
+# ✅ 모델: DeepSeek-R1 (Ollama)
+# ✅ UI: Gradio
+# ------------------------------------------------------------
+# 준비사항 (터미널에서 1회만):
+#   1) Ollama 설치: https://ollama.com/download
+#   2) 모델 다운로드:  ollama pull deepseek-r1:latest
+#   3) Ollama 서버 실행(보통 자동): http://localhost:11434
+# ------------------------------------------------------------
+# 필요 패키지 설치(없다면 주석 해제하여 설치):
+# !pip install gradio langchain langchain-core langchain-community langchain-experimental
+# 또는 최신 ollama 통합 패키지를 쓰는 경우:
+# !pip install langchain-ollama
+# ============================================================
+
+import gradio as gr
+from typing import Optional
+
+# LangChain Prompt/Parser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+# Ollama용 Chat 모델 import (버전에 따라 경로가 다를 수 있어 try/except 처리)
+try:
+    from langchain_ollama import ChatOllama  # 최신 권장 경로
+except Exception:
+    from langchain_community.chat_models import ChatOllama  # 구버전 fallback
+
+
+# -----------------------------
+# LLM 생성 유틸
+# -----------------------------
+def get_llm(model_name: str = "deepseek-r1:latest", temperature: float = 0.7) -> ChatOllama:
+    """Ollama의 DeepSeek-R1 Chat 모델을 생성합니다.
+    - model_name: Ollama에 설치된 모델 태그(예: deepseek-r1:latest)
+    - temperature: 창의성 정도(0.0~1.0 권장)
+    """
+    return ChatOllama(
+        model=model_name,
+        temperature=temperature,
+        # 일부 구현은 아래 인자를 지원하지 않을 수 있습니다. 문제가 되면 제거하세요.
+        num_ctx=8192,
+        streaming=False,
+    )
+
+
+def build_chain(system_prompt: str, temperature: float, model_name: str):
+    """프롬프트 → LLM → 문자열 파서 체인을 구성합니다."""
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("user", "{input}")
+    ])
+    llm = get_llm(model_name=model_name, temperature=temperature)
+    output_parser = StrOutputParser()
+    chain = prompt | llm | output_parser
+    return chain
+
+
+# -----------------------------
+# Gradio 핸들러
+# -----------------------------
+
+def infer(user_input: str, system_prompt: str, temperature: float, model_name: str) -> str:
+    """단일 질의 응답 핸들러."""
+    if not user_input.strip():
+        return "질문을 입력해주세요."
+    try:
+        chain = build_chain(system_prompt=system_prompt, temperature=temperature, model_name=model_name)
+        result = chain.invoke({"input": user_input})
+        # LangChain 객체가 올 수도 있어 문자열 변환
+        return str(result)
+    except Exception as e:
+        return f"오류가 발생했습니다: {e}"
+
+
+# ============================================================
+# Gradio UI 구성
+# ============================================================
+with gr.Blocks(title="Ollama · DeepSeek-R1 · LangChain UI", theme=gr.themes.Soft()) as demo:
+    gr.Markdown(
+        """
+        # 🧪 Ollama · DeepSeek-R1 · LangChain
+        OpenAI 대신 **로컬 LLM(DeepSeek-R1, Ollama)**으로 동작하는 간단한 채팅 UI입니다.
+        - API Key 불필요
+        - 모델 준비: `ollama pull deepseek-r1:latest`
+        - ⚙️ 아래 설정에서 시스템 프롬프트/온도/모델명을 바꿀 수 있습니다.
+        """
+    )
+
+    with gr.Row():
+        with gr.Column(scale=2):
+            user_input = gr.Textbox(label="질문 입력", placeholder="무엇이든 물어보세요! 예: hi", lines=6)
+            btn = gr.Button("💬 실행", variant="primary")
+            output = gr.Markdown()
+        with gr.Column(scale=1):
+            system_prompt = gr.Textbox(
+                label="System Prompt",
+                value="You are a helpful assistant.",
+                lines=6,
+            )
+            temperature = gr.Slider(0.0, 1.5, value=0.7, step=0.1, label="Temperature")
+            model_name = gr.Textbox(label="Ollama 모델명", value="deepseek-r1:latest")
+            gr.Markdown(
+                """
+                **Tips**
+                - 모델 설치: `ollama pull deepseek-r1:latest`
+                - 다른 모델을 쓰고 싶다면 모델명에 예: `llama3.1:8b-instruct` 등을 입력.
+                - 출력이 길거나 느리면 Temperature를 낮추거나, num_ctx를 줄여보세요.
+                """
+            )
+
+    btn.click(fn=infer, inputs=[user_input, system_prompt, temperature, model_name], outputs=output)
+
+
+# 애플리케이션 실행
+if __name__ == "__main__":
+    # 외부 접속이 필요 없으면 share=False로 두세요.
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+
+

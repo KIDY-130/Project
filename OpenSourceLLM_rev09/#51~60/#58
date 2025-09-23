@@ -1,0 +1,264 @@
+#58
+"""
+ChatPDF (Gradio + Ollama + DeepSeek-R1 + Chroma)
+- Closed LLM/OpenAI 의존 제거
+- 로컬/서버에 설치된 Ollama 모델 사용 (DeepSeek-R1)
+- UI: Streamlit → Gradio
+- PDF 업로드 → 분할 → 임베딩 → Chroma에 저장 → RAG 질의
+- Streamlit Cloud/서버 환경의 sqlite 이슈를 피하기 위해 pysqlite3-binary 우회 코드 적용
+
+사전 준비
+1) Ollama 설치 및 실행 (로컬 또는 서버): https://ollama.com
+2) 모델 받기
+   - LLM:      $ ollama pull deepseek-r1:8b
+   - Embedding: $ ollama pull nomic-embed-text
+3) 패키지 설치
+   $ pip install -r requirements.txt
+
+실행
+   $ python app.py
+"""
+
+# --- SQLite 대체 (Streamlit Cloud/일부 리눅스 환경용) ---
+# 요청에 따라 주석 해제(활성화) 합니다.
+__import__('pysqlite3')
+import sys
+sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+
+from __future__ import annotations
+import os
+import re
+import tempfile
+from typing import List
+
+import gradio as gr
+
+# LangChain & 데이터 처리
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain.schema import Document
+from langchain.callbacks.base import BaseCallbackHandler
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain.retrievers.multi_query import MultiQueryRetriever
+
+# Ollama (LLM/Embeddings)
+from langchain_ollama.llms import OllamaLLM
+from langchain_ollama.embeddings import OllamaEmbeddings
+
+# ------------------------------
+# 설정
+# ------------------------------
+LLM_MODEL = "deepseek-r1:8b"           # 추론용
+EMBED_MODEL = "nomic-embed-text"       # 임베딩용 (Ollama 지원)
+CHUNK_SIZE = 600
+CHUNK_OVERLAP = 80
+TOP_K = 4
+TEMPERATURE = 0.2
+MAX_TOKENS = 1024
+
+# DeepSeek-R1의 <think> 블록 제거용 정규식
+THINK_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+def strip_reasoning(text: str) -> str:
+    """DeepSeek-R1이 반환하는 사유 블록(<think>...</think>) 제거"""
+    return THINK_BLOCK_PATTERN.sub("", text).strip()
+
+# ------------------------------
+# PDF → Documents
+# ------------------------------
+def pdf_to_documents(pdf_bytes: bytes, filename: str) -> List[Document]:
+    """업로드된 PDF 바이트를 임시파일로 저장 후 LangChain Documents로 로드"""
+    tmpdir = tempfile.TemporaryDirectory()
+    temp_path = os.path.join(tmpdir.name, filename)
+    with open(temp_path, "wb") as f:
+        f.write(pdf_bytes)
+    loader = PyPDFLoader(temp_path)
+    pages = loader.load_and_split()
+    return pages
+
+# ------------------------------
+# Chroma 벡터스토어 생성
+# ------------------------------
+def build_vectorstore(docs: List[Document]):
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        length_function=len,
+        is_separator_regex=False,
+    )
+    chunks = splitter.split_documents(docs)
+
+    # Ollama 임베딩
+    embeddings = OllamaEmbeddings(model=EMBED_MODEL)
+    # 메모리형 Chroma 인덱스 (필요 시 persist_directory로 디스크 저장 가능)
+    vectordb = Chroma.from_documents(chunks, embedding=embeddings)
+    return vectordb
+
+# ------------------------------
+# 프롬프트 (Hub 의존 제거, 자체 프롬프트 사용)
+# ------------------------------
+RAG_PROMPT = PromptTemplate.from_template(
+    """You are a helpful assistant. Use the provided context to answer the question.
+If the answer is not in the context, say you don't know briefly.
+
+# Context
+{context}
+
+# Question
+{question}
+
+# Answer (be concise):"""
+)
+
+# ------------------------------
+# 스트리밍 핸들러 (Gradio와 호환되도록 토큰 누적 제공)
+# ------------------------------
+class StreamToBufferHandler(BaseCallbackHandler):
+    def __init__(self):
+        self.buffer = ""
+
+    def on_llm_new_token(self, token: str, **kwargs) -> None:
+        self.buffer += token
+
+    def read(self) -> str:
+        return self.buffer
+
+# ------------------------------
+# 파이프라인 구성
+# ------------------------------
+def build_chain(vectordb):
+    # 로컬 LLM (Ollama)
+    llm = OllamaLLM(
+        model=LLM_MODEL,
+        temperature=TEMPERATURE,
+        num_predict=MAX_TOKENS,
+    )
+
+    # 다중 쿼리로 리트리버를 강화 (질문 변형을 LLM이 생성)
+    retriever = MultiQueryRetriever.from_llm(
+        retriever=vectordb.as_retriever(search_kwargs={"k": TOP_K}),
+        llm=llm
+    )
+
+    def format_docs(docs: List[Document]) -> str:
+        return "\n\n".join(d.page_content for d in docs)
+
+    chain = (
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        | RAG_PROMPT
+        | llm
+        | StrOutputParser()
+    )
+    return chain
+
+# ------------------------------
+# Gradio 상호작용 함수
+# ------------------------------
+def ingest_pdf(pdf_file):
+    """PDF 업로드 후 인덱스 구축"""
+    if pdf_file is None:
+        return None, "❗ PDF 파일을 업로드해 주세요."
+    docs = pdf_to_documents(pdf_file.read(), pdf_file.name)
+    vectordb = build_vectorstore(docs)
+    return vectordb, "✅ 인덱스 구축 완료! 이제 질문해 보세요."
+
+def ask_question(state, question):
+    """질문 → RAG 실행 (스트리밍)"""
+    if state is None:
+        yield "❗ 먼저 PDF를 업로드하여 인덱스를 생성해 주세요."
+        return
+    if not question or not question.strip():
+        yield "❗ 질문을 입력해 주세요."
+        return
+
+    chain = build_chain(state)
+    # DeepSeek-R1의 추론 토큰을 스트리밍으로 받을 핸들러
+    handler = StreamToBufferHandler()
+
+    # LangChain의 스트리밍은 콜백과 제너레이터를 조합해 처리
+    # OllamaLLM은 토큰 단위 콜백을 호출함
+    # 여기서는 간단히 invoke 후 <think> 제거만 수행 (실시간 토큰 송출이 필요하면 LCEL의 stream() 활용)
+    try:
+        # stream 모드: chain.stream(question) 사용 가능 (LangChain 0.2+)
+        # 여기서는 간단히 invoke 후 결과 반환
+        result = chain.invoke(question, config={"callbacks": [handler]})
+        clean = strip_reasoning(result)
+        # 콜백 buffer(중간 토큰)와 최종 답이 다를 수 있으므로 최종 클린 텍스트를 출력
+        yield clean if clean else (handler.read() or "⚠️ 빈 응답입니다.")
+    except Exception as e:
+        yield f"🚫 오류 발생: {e}"
+
+# ------------------------------
+# Gradio UI
+# ------------------------------
+with gr.Blocks(title="ChatPDF (Ollama + DeepSeek-R1)") as demo:
+    gr.Markdown("# ChatPDF 📄🔎  \n로컬/서버의 **Ollama + DeepSeek-R1**과 **Chroma**로 PDF를 질의합니다.")
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            pdf = gr.File(label="PDF 업로드", file_types=[".pdf"])
+            build_btn = gr.Button("인덱스 생성", variant="primary")
+            status = gr.Markdown()
+
+            # 상태: 벡터DB 핸들 (세션 내 저장)
+            vectordb_state = gr.State()
+
+        with gr.Column(scale=1):
+            question = gr.Textbox(label="질문", placeholder="예) 2장 실험 결과 요약해줘", lines=2)
+            ask_btn = gr.Button("질문하기", variant="secondary")
+            answer = gr.Markdown()
+
+    # 이벤트 바인딩
+    build_btn.click(fn=ingest_pdf, inputs=[pdf], outputs=[vectordb_state, status])
+    ask_btn.click(fn=ask_question, inputs=[vectordb_state, question], outputs=[answer])
+
+    gr.Markdown("---\n**팁**\n- 여러 PDF를 합쳐 질의하려면 하나의 PDF로 병합 후 업로드하세요.\n- 임베딩/LLM 모델은 파일 상단 상수(LLM_MODEL, EMBED_MODEL)로 변경 가능합니다.")
+
+if __name__ == "__main__":
+    # Gradio 서버 실행
+    # Cloud에서 외부 공개 필요 시 server_name="0.0.0.0"
+    demo.queue().launch(server_name="0.0.0.0", server_port=7860, show_api=False)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+‘’‘
+# Core
+gradio>=4.36.0
+ollama>=0.3.0
+
+# LangChain & integrations
+langchain>=0.2.12
+langchain-community>=0.2.10
+langchain-core>=0.2.24
+langchain-text-splitters>=0.2.2
+langchain-chroma>=0.1.2
+langchain-ollama>=0.1.0
+
+# Vector store
+chromadb>=0.5.3
+
+# PDF
+pypdf>=4.2.0
+
+# SQLite shim for serverless containers (VERY IMPORTANT)
+pysqlite3-binary
+
+# (Optional) for better performance on some platforms
+uvicorn
+’‘’
