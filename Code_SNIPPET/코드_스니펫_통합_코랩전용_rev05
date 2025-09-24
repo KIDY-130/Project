@@ -1,0 +1,615 @@
+# =============================
+# 🚀 DeepSeek-R1 AI Toolkit (빠른 실행 최적화 버전) — Gradio queue 수정
+# =============================
+
+# ---------- 환경/설치 최소화 & 캐싱 ----------
+print("📦 환경 점검 중...")
+
+import os, shutil, subprocess, time, re, json
+from datetime import datetime
+from pathlib import Path
+
+def sh(cmd: str):
+    return subprocess.run(cmd, shell=True, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+# Java (tabula/camelot 필요) — 없을 때만 설치
+if shutil.which("java") is None:
+    print("👉 Java 설치")
+    sh("apt-get update -qq && apt-get install -y openjdk-11-jdk-headless")
+os.environ['JAVA_HOME'] = '/usr/lib/jvm/java-11-openjdk-amd64'
+
+# pip 패키지 — 필요한 것만 & 없을 때만
+def ensure(mod: str, pip_name: str = None):
+    pip_name = pip_name or mod
+    try:
+        __import__(mod)
+    except Exception:
+        print(f"📥 install {pip_name}")
+        sh(f"pip install -q {pip_name}")
+
+print("🐍 필수 패키지 확인")
+for mod, pipn in [
+    ("gradio","gradio"),
+    ("ollama","ollama"),
+    ("fitz","pymupdf"),
+    ("pandas","pandas"),
+    ("PIL","Pillow"),
+    ("numpy","numpy"),
+    ("langchain_community","langchain-community"),
+    ("langchain_chroma","langchain-chroma"),
+    ("langchain_text_splitters","langchain-text-splitters"),
+    ("beautifulsoup4","beautifulsoup4"),
+    ("duckduckgo_search","duckduckgo-search"),
+]:
+    ensure(mod, pipn)
+
+# Ollama 설치
+print("🦙 Ollama 준비")
+if shutil.which("ollama") is None:
+    sh("curl -fsSL https://ollama.com/install.sh | sh")
+
+# 서버 백그라운드
+subprocess.Popen(["ollama","serve"])
+time.sleep(3)
+
+# 모델 구성: 빠른 모델 / 무거운 모델 / VLM
+FAST_MODEL  = "qwen2.5:7b-instruct"   # 빠른 생성/도구 탭
+HEAVY_MODEL = "deepseek-r1"           # RAG 등 긴 추론 필요 시
+VLM_MODEL   = "qwen2.5-vl"            # 비전-텍스트
+EMB_MODEL   = "nomic-embed-text"      # 임베딩
+
+print("📥 필요한 모델 pull")
+for m in [FAST_MODEL, HEAVY_MODEL, VLM_MODEL, EMB_MODEL]:
+    sh(f"ollama pull {m}")
+
+# 간단 웜업(첫 토큰 지연 감소)
+print("🔥 모델 웜업")
+sh(f'''python - <<'PY'
+import ollama
+for m in ["{FAST_MODEL}", "{HEAVY_MODEL}"]:
+    try:
+        ollama.chat(model=m, messages=[{{"role":"user","content":"hi"}}], options={{"num_predict":8}})
+    except Exception as e:
+        print("warmup err:", m, e)
+PY''')
+print("✅ 환경 준비 완료")
+
+# =============================
+# 🧠 메인 애플리케이션 코드
+# =============================
+from typing import Optional, List, Dict
+import gradio as gr
+import ollama
+import fitz  # PyMuPDF
+import pandas as pd
+import numpy as np
+from PIL import Image, ImageDraw
+
+from langchain_community.chat_models import ChatOllama
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+
+from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_community.tools import DuckDuckGoSearchResults
+
+# ---------- 전역 ----------
+class GlobalState:
+    def __init__(self):
+        self.cache = {}  # (model, temp, opts_key) -> ChatOllama
+        self.rag_vectorstore: Optional[Chroma] = None
+        self.rag_embeddings: Optional[OllamaEmbeddings] = None
+        self.last_rag_sources: List[Dict] = []
+
+    def get_llm(self, model_name=FAST_MODEL, temperature=0.7, **model_kwargs) -> ChatOllama:
+        # 주요 속도옵션: num_predict(응답길이), num_ctx
+        if "num_predict" not in model_kwargs:
+            model_kwargs["num_predict"] = 256
+        opts_key = tuple(sorted(model_kwargs.items()))
+        key = (model_name, float(temperature), opts_key)
+        if key not in self.cache:
+            self.cache[key] = ChatOllama(
+                model=model_name,
+                temperature=temperature,
+                model_kwargs=model_kwargs
+            )
+        return self.cache[key]
+
+STATE = GlobalState()
+DEFAULT_PERSIST_DIR = "./chroma_db_store"
+os.makedirs(DEFAULT_PERSIST_DIR, exist_ok=True)
+
+# ---------- 헬퍼 ----------
+def log(message: str) -> str:
+    ts = datetime.now().strftime('%H:%M:%S')
+    return f"[{ts}] {message}\n"
+
+def strip_think_tags(text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL|re.IGNORECASE).strip()
+
+def safe_json_extract(text: str):
+    """빠르고 안전한 JSON 추출"""
+    if not isinstance(text, str):
+        return None
+    m = re.search(r"```json\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*```", text, flags=re.I)
+    if m:
+        try: return json.loads(m.group(1))
+        except: pass
+    text_wo = re.sub(r"```(?!json)[\s\S]*?```", "", text, flags=re.I)
+    cands = []
+    for p in (r"\{[\s\S]*?\}", r"\[[\s\S]*?\]"):
+        for mm in re.finditer(p, text_wo):
+            cands.append(mm.group(0))
+    for chunk in sorted(cands, key=len, reverse=True):
+        try: return json.loads(chunk)
+        except: pass
+    try: return json.loads(text_wo.strip())
+    except: return None
+
+def call_vlm(image_paths: list, prompt: str, vlm_model: str) -> str:
+    try:
+        messages = [{"role": "user", "content": prompt, "images": image_paths}]
+        res = ollama.chat(model=vlm_model, messages=messages, options={"num_predict":256})
+        return res.get("message", {}).get("content", "VLM 호출 실패")
+    except Exception as e:
+        return f"VLM 오류: {e}"
+
+# =============================
+# 1) 💬 챗봇
+# =============================
+PERSONAS = {
+    "기본 상담사": "너는 사용자를 도와주는 친절하고 유능한 상담사야.",
+    "백설공주 마법거울": "너는 백설공주 이야기 속 마법 거울이야. 품위 있고 운율감 있게 답해줘.",
+    "유치원생": "너는 5살 유치원생이야. 짧고 쉬운 말로 귀엽게 대답해.",
+}
+
+def handle_chatbot_stream(message: str, history: list, persona: str, temperature: float):
+    if not message.strip(): return
+    llm = STATE.get_llm(model_name=FAST_MODEL, temperature=temperature, num_predict=256)
+    system_prompt = PERSONAS.get(persona, PERSONAS["기본 상담사"])
+    msgs = [SystemMessage(content=system_prompt)]
+    for t in history:
+        msgs.append(HumanMessage(content=t["content"]) if t["role"]=="user" else AIMessage(content=t["content"]))
+    msgs.append(HumanMessage(content=message))
+    stream = llm.stream(msgs)
+    history.append({"role":"user","content":message})
+    history.append({"role":"assistant","content":""})
+    for ch in stream:
+        history[-1]["content"] += ch.content
+        yield history
+
+# =============================
+# 2) 📄 PDF & 문서
+# =============================
+def handle_pdf_summary(pdf_file, chunk_size: int, temperature: float, progress=gr.Progress()):
+    if not pdf_file: return "PDF 파일을 업로드하세요.", ""
+    llm = STATE.get_llm(model_name=FAST_MODEL, temperature=temperature, num_predict=256)
+    progress(0, desc="PDF에서 텍스트 추출 중...")
+    doc = fitz.open(pdf_file.name)
+    full_text = "\n".join([p.get_text() for p in doc]); doc.close()
+    if not full_text.strip(): return "PDF에서 텍스트를 추출할 수 없습니다.", full_text
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=int(chunk_size*0.1))
+    chunks = splitter.split_text(full_text)
+    system_prompt = "다음 텍스트는 문서의 일부입니다. 핵심을 정확·간결히 요약하세요."
+    summaries = []
+    for c in progress.tqdm(chunks, desc="각 청크 요약 중..."):
+        s = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=c)]).content
+        summaries.append(s)
+    if len(summaries)==1:
+        final = summaries[0]
+    else:
+        progress(0.85, desc="부분 요약 통합 중...")
+        final = llm.invoke([
+            SystemMessage(content="부분 요약들을 종합해 전체 요약 10~15줄."),
+            HumanMessage(content="\n\n---\n\n".join(summaries))
+        ]).content
+    return final, full_text
+
+def handle_pdf_extraction(pdf_file, header_px: int, footer_px: int):
+    if not pdf_file: return "PDF 파일을 업로드하세요.", [], None
+    out = Path("outputs/pdf_extraction"); out.mkdir(parents=True, exist_ok=True)
+    doc = fitz.open(pdf_file.name)
+    full_text, images = "", []
+    for i, page in enumerate(doc):
+        rect = page.rect
+        text = page.get_text("text", clip=(0, header_px, rect.width, rect.height-footer_px))
+        full_text += f"--- Page {i+1} ---\n{text}\n\n"
+        for idx, img in enumerate(page.get_images(full=True)):
+            xref = img[0]; base = doc.extract_image(xref)
+            path = out / f"page{i+1}_img{idx+1}.{base['ext']}"
+            with open(path,"wb") as f: f.write(base["image"])
+            images.append(str(path))
+    doc.close()
+    return full_text, images, str(out)
+
+def handle_pdf_table_extraction(pdf_file):
+    if not pdf_file: return None, "PDF 파일을 업로드하세요.", None
+    # 지연 임포트
+    try:
+        import camelot; import tabula
+    except Exception:
+        return None, "테이블 추출 라이브러리가 설치되지 않았습니다.", None
+    os.environ['JAVA_HOME'] = '/usr/lib/jvm/java-11-openjdk-amd64'
+    out = Path("outputs/table_extraction"); out.mkdir(parents=True, exist_ok=True)
+    pdf_path = pdf_file.name; log_text = ""
+    log_text += log("Camelot으로 추출 시도 중...")
+    try:
+        tables = camelot.read_pdf(pdf_path, flavor='lattice', pages='all')
+        if tables.n>0:
+            df = tables[0].df; xls = out/"extracted_tables_camelot.xlsx"
+            df.to_excel(xls, index=False); return df, log_text+log(f"{tables.n}개 표 발견"), str(xls)
+    except Exception as e:
+        log_text += log(f"Camelot 실패: {e}")
+    log_text += log("Tabula로 추출 시도 중...")
+    try:
+        frames = tabula.read_pdf(pdf_path, pages='all', multiple_tables=True)
+        if frames:
+            df = frames[0]; xls = out/"extracted_tables_tabula.xlsx"
+            df.to_excel(xls, index=False); return df, log_text+log(f"{len(frames)}개 표 발견"), str(xls)
+    except Exception as e:
+        log_text += log(f"Tabula 실패: {e}")
+    return None, log_text+log("표를 추출하지 못했습니다."), None
+
+# =============================
+# 3) 🧠 RAG 챗봇 (무거운 모델만 사용)
+# =============================
+def handle_rag_indexing(pdf_files, chunk_size: int, chunk_overlap: int, progress=gr.Progress()):
+    if not pdf_files: return "색인할 PDF 파일을 업로드하세요.", gr.update(interactive=False)
+    log_text = ""
+    try:
+        progress(0, desc="임베딩 모델 로딩 중...")
+        STATE.rag_embeddings = OllamaEmbeddings(model=EMB_MODEL)
+        log_text += log("임베딩 모델 로드 완료.")
+        all_docs = []
+        for f in progress.tqdm(pdf_files, desc="PDF 파일 처리 중..."):
+            loader = PyPDFLoader(f.name)
+            docs = loader.load()
+            splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+            all_docs.extend(splitter.split_documents(docs))
+        log_text += log(f"총 {len(pdf_files)}개 PDF에서 {len(all_docs)}개 청크 생성.")
+        progress(0.85, desc="ChromaDB 저장 중...")
+        STATE.rag_vectorstore = Chroma.from_documents(
+            documents=all_docs,
+            embedding=STATE.rag_embeddings,
+            persist_directory=DEFAULT_PERSIST_DIR
+        )
+        log_text += log("벡터 DB 색인 완료. 질문 가능.")
+        return log_text, gr.update(interactive=True)
+    except Exception as e:
+        return f"색인 중 오류 발생: {e}", gr.update(interactive=False)
+
+def handle_rag_chat_stream(message: str, history: list, temperature: float):
+    if not STATE.rag_vectorstore:
+        yield "먼저 PDF 파일을 색인해주세요."; return
+    llm = STATE.get_llm(model_name=HEAVY_MODEL, temperature=temperature, num_predict=512)
+    retriever = STATE.rag_vectorstore.as_retriever(search_kwargs={"k": 5})
+    history.append({"role":"user","content":message})
+    docs = retriever.invoke(message)
+    STATE.last_rag_sources = [
+        {"source": d.metadata.get('source','N/A'), "page": d.metadata.get('page','N/A'), "content": d.page_content}
+        for d in docs
+    ]
+    system_prompt = "제공된 컨텍스트에 기반해 정확히 답하세요. 모르면 모른다고 답하기."
+    prompt_template = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("system", "컨텍스트:\n{context}"),
+        ("human", "{input}")
+    ])
+    chain = create_stuff_documents_chain(llm, prompt_template)
+    history.append({"role":"assistant","content":""})
+    resp = ""
+    for ch in chain.stream({"input": message, "context": docs}):
+        resp += ch; history[-1]["content"] = resp; yield history
+
+def update_rag_sources_display():
+    if not STATE.last_rag_sources: return "검색된 문서가 없습니다."
+    md = "### 📚 답변에 참조된 문서\n\n"
+    for i, s in enumerate(STATE.last_rag_sources):
+        md += f"**[출처 {i+1}]**\n- **파일**: `{os.path.basename(s['source'])}` (페이지: {s['page']})\n- **내용 일부**: {s['content'][:200]}...\n\n"
+    return md
+
+# =============================
+# 4) 🖼️ 이미지 분석
+# =============================
+def handle_single_image_analysis(image, prompt: str, vlm_model: str, use_refine: bool, temperature: float):
+    if image is None: return "이미지를 업로드하세요.", ""
+    analysis = call_vlm([image.name], prompt, vlm_model)
+    if not use_refine: return analysis, analysis
+    llm = STATE.get_llm(model_name=FAST_MODEL, temperature=temperature, num_predict=200)
+    refined = llm.invoke(f"다음 분석을 간결하고 정보가 풍부하게 정리:\n{analysis}").content
+    return refined, analysis
+
+def handle_image_comparison(image1, image2, prompt: str, vlm_model: str, use_refine: bool, temperature: float):
+    if image1 is None or image2 is None: return "두 이미지를 모두 업로드하세요.", ""
+    comparison = call_vlm([image1.name, image2.name], prompt, vlm_model)
+    if not use_refine: return comparison, comparison
+    llm = STATE.get_llm(model_name=FAST_MODEL, temperature=temperature, num_predict=220)
+    refined = llm.invoke(f"다음 비교결과를 항목화해 정리:\n{comparison}").content
+    return refined, comparison
+
+# =============================
+# 5) 🛠️ 고급 생성기
+# =============================
+def handle_mermaid_generation(idea: str, diagram_type: str, use_llm: bool):
+    if not idea.strip(): return "", "", "아이디어를 입력하세요."
+    if not use_llm:
+        code, status = idea, "LLM 미사용"
+    else:
+        llm = STATE.get_llm(model_name=FAST_MODEL, temperature=0.1, num_predict=192)
+        sys = f"Mermaid {diagram_type} 타입의 '유효한' 코드만 코드블록으로 출력. 설명 금지."
+        resp = llm.invoke([SystemMessage(content=sys), HumanMessage(content=idea)]).content
+        m = re.search(r"```mermaid\s*([\s\S]*?)```", resp)
+        if m: code, status = m.group(1).strip(), "Mermaid 코드 생성 완료."
+        else:
+            code = re.sub(r"^.*?mermaid", "", resp, flags=re.S|re.I).strip()
+            status = "코드 블록 미검출 → 본문에서 추출"
+    return f"```mermaid\n{code}\n```", code, status
+
+def handle_sd_prompt_generation(idea: str):
+    if not idea.strip(): return "", "", "아이디어를 입력하세요."
+    llm = STATE.get_llm(model_name=FAST_MODEL, temperature=0.6, num_predict=160)
+    sys = "Stable Diffusion 프롬프트 엔지니어. JSON으로만 응답하고 keys=['prompt','negative_prompt'] 포함."
+    resp = llm.invoke([SystemMessage(content=sys), HumanMessage(content=f"아이디어: {idea}")]).content
+    data = safe_json_extract(resp)
+    if isinstance(data, dict):
+        return data.get("prompt", idea), data.get("negative_prompt","low quality, blurry"), "프롬프트 생성 완료."
+    return idea, "", "JSON 파싱 실패. 원본 응답:\n"+resp
+
+def handle_structured_ocr(image, use_llm: bool):
+    if image is None: return None, "", None, "이미지를 업로드하세요."
+    # 지연 임포트
+    try:
+        import easyocr
+    except Exception:
+        return None, "EasyOCR 미설치 또는 로딩 실패.", None, ""
+    reader = easyocr.Reader(['ko','en'])
+    np_img = np.array(image)
+    results = reader.readtext(np_img)
+    overlay = image.copy(); draw = ImageDraw.Draw(overlay)
+    full_text = "\n".join([r[1] for r in results])
+    for (bbox, text, prob) in results:
+        draw.polygon([tuple(p) for p in bbox], outline="cyan", width=2)
+    if not use_llm: return overlay, full_text, None, "LLM 미사용"
+    llm = STATE.get_llm(model_name=FAST_MODEL, temperature=0.1, num_predict=220)
+    resp = llm.invoke([
+        SystemMessage(content="OCR 텍스트를 구조화 JSON으로 변환. 표면 구조 인식 시 rows/columns or items 사용."),
+        HumanMessage(content=full_text)
+    ]).content
+    data = safe_json_extract(resp); df = None
+    if isinstance(data, dict):
+        if 'items' in data and isinstance(data['items'], list):
+            df = pd.DataFrame(data['items'])
+        elif 'rows' in data and 'columns' in data:
+            df = pd.DataFrame(data['rows'], columns=data['columns'])
+    return overlay, full_text, df, (json.dumps(data, ensure_ascii=False, indent=2) if data else "")
+
+# =============================
+# 6) 🌐 웹 & 도구
+# =============================
+def handle_sequential_thinking(query: str, temperature: float, progress=gr.Progress()):
+    if not query.strip(): return "", "", "", "질의를 입력하세요."
+    llm = STATE.get_llm(model_name=FAST_MODEL, temperature=temperature, num_predict=256)
+    progress(0.1, desc="[1/3] 분석 중...")
+    analysis = llm.invoke([SystemMessage(content="핵심 쟁점을 3~5줄로."), HumanMessage(content=query)]).content
+    progress(0.5, desc="[2/3] 최종 답변 생성 중...")
+    answer = llm.invoke([SystemMessage(content="간결·정확·구조화된 답변 8~12줄."), HumanMessage(content=f"{query}\n\n분석:{analysis}")]).content
+    progress(0.8, desc="[3/3] 검증 중...")
+    reflection = llm.invoke([SystemMessage(content="모호성/누락/과장 점검 후 3줄 제안."), HumanMessage(content=f"답변:{answer}")]).content
+    return analysis, answer, reflection, "모든 단계 완료."
+
+def handle_web_rag(query: str, temperature: float, progress=gr.Progress()):
+    llm = STATE.get_llm(model_name=FAST_MODEL, temperature=temperature, num_predict=256)
+    progress(0, desc="웹 검색 중...")
+    search = DuckDuckGoSearchResults()
+    search_results = search.run(query)
+    links = re.findall(r'https?://[^\s,```<>"]+', search_results)
+    if not links: return "관련 웹 페이지를 찾지 못했습니다.", search_results, ""
+    links = links[:2]  # 속도 위해 상위 2개만
+    progress(0.35, desc=f"{len(links)}개 링크 수집 중...")
+    try:
+        # bs_kwargs는 버전별 차이가 있어 제거(안정성 우선)
+        loader = WebBaseLoader(web_paths=links)
+        docs = loader.load()
+        ctx = "\n\n---\n\n".join([d.page_content for d in docs])
+    except Exception as e:
+        ctx = f"콘텐츠 수집 실패: {e}"
+    progress(0.7, desc="답변 생성 중...")
+    resp = llm.invoke([SystemMessage(content="웹 결과 기반으로 정확·간결히 답변."), HumanMessage(content=f"검색 결과:\n{ctx}\n\n질문: {query}")]).content
+    return resp, search_results, "\n".join(links)
+
+# =============================
+# 7) Gradio UI
+# =============================
+def build_ui():
+    with gr.Blocks(theme=gr.themes.Soft(), title="DeepSeek-R1 AI Toolkit") as demo:
+        gr.Markdown("# 🚀 DeepSeek-R1 AI Toolkit (All-in-One)")
+        gr.Markdown("38개 예제를 통합한 로컬 AI 애플리케이션입니다. (속도 최적화)")
+
+        # 챗봇
+        with gr.Tab("💬 챗봇"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    persona = gr.Dropdown(list(PERSONAS.keys()), value="기본 상담사", label="페르소나 선택")
+                    temp = gr.Slider(0.0, 1.5, value=0.7, step=0.1, label="Temperature")
+                with gr.Column(scale=3):
+                    win = gr.Chatbot(height=500, label="대화창", type="messages")
+                    with gr.Row():
+                        msg = gr.Textbox(label="메시지 입력", placeholder="무엇이든 물어보세요...", scale=4)
+                        btn = gr.Button("전송", variant="primary", scale=1)
+                        clr = gr.Button("초기화")
+
+            def on_submit(m, h, p, t):
+                for nh in handle_chatbot_stream(m, h, p, t):
+                    yield nh, ""
+            msg.submit(on_submit, [msg, win, persona, temp], [win, msg])
+            btn.click(on_submit, [msg, win, persona, temp], [win, msg])
+            clr.click(lambda: [], None, win)
+
+        # PDF & 문서
+        with gr.Tab("📄 PDF & 문서"):
+            with gr.Tabs():
+                with gr.TabItem("PDF 요약"):
+                    with gr.Row():
+                        f_in = gr.File(label="PDF 파일", file_types=[".pdf"])
+                        with gr.Column():
+                            chunk = gr.Slider(1000, 8000, value=4000, step=500, label="청크 크기")
+                            t = gr.Slider(0.0, 1.0, value=0.2, step=0.1, label="Temperature")
+                            run = gr.Button("요약 실행", variant="primary")
+                    out = gr.Textbox(label="요약 결과", lines=15)
+                    with gr.Accordion("전체 텍스트", open=False):
+                        raw = gr.Textbox(label="원본 텍스트", lines=10)
+                    run.click(handle_pdf_summary, [f_in, chunk, t], [out, raw])
+
+                with gr.TabItem("텍스트/이미지 추출"):
+                    with gr.Row():
+                        f_in2 = gr.File(label="PDF 파일", file_types=[".pdf"])
+                        with gr.Column():
+                            head = gr.Slider(0, 200, value=60, label="헤더 높이 (px)")
+                            foot = gr.Slider(0, 200, value=60, label="푸터 높이 (px)")
+                            run2 = gr.Button("추출 실행", variant="primary")
+                    with gr.Row():
+                        tx = gr.Textbox(label="추출된 텍스트", lines=15, scale=2)
+                        with gr.Column(scale=1):
+                            gal = gr.Gallery(label="추출된 이미지", height=400)
+                            pth = gr.Textbox(label="저장 경로")
+                    run2.click(handle_pdf_extraction, [f_in2, head, foot], [tx, gal, pth])
+
+                with gr.TabItem("표 추출"):
+                    f_tbl = gr.File(label="PDF 파일", file_types=[".pdf"])
+                    run3 = gr.Button("표 추출 실행", variant="primary")
+                    df = gr.Dataframe(label="추출된 표")
+                    logbx = gr.Textbox(label="처리 로그", lines=5)
+                    xfile = gr.File(label="엑셀 다운로드")
+                    run3.click(handle_pdf_table_extraction, [f_tbl], [df, logbx, xfile])
+
+        # RAG
+        with gr.Tab("🧠 RAG 챗봇"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.Markdown("##### 1. 문서 색인")
+                    f_multi = gr.File(label="PDF 파일들", file_count="multiple", file_types=[".pdf"])
+                    cs = gr.Slider(200, 2000, value=1000, label="청크 크기")
+                    co = gr.Slider(0, 500, value=100, label="청크 중첩")
+                    idx = gr.Button("색인 시작", variant="primary")
+                    stat = gr.Textbox(label="색인 상태", lines=10)
+                with gr.Column(scale=2):
+                    gr.Markdown("##### 2. 문서 기반 대화")
+                    rag_chat = gr.Chatbot(height=450, label="대화창", type="messages")
+                    with gr.Accordion("참조 문서", open=False):
+                        rag_src = gr.Markdown()
+                    rtemp = gr.Slider(0.0, 1.0, value=0.3, label="Temperature")
+                    rmsg = gr.Textbox(label="질문", placeholder="문서에 대해 질문하세요...", interactive=False)
+                    rsend = gr.Button("전송", variant="primary")
+
+            idx.click(handle_rag_indexing, [f_multi, cs, co], [stat, rmsg])
+
+            def on_rag_submit(m, h, t):
+                for nh in handle_rag_chat_stream(m, h, t):
+                    yield nh, ""
+            rmsg.submit(on_rag_submit, [rmsg, rag_chat, rtemp], [rag_chat, rmsg]).then(update_rag_sources_display, None, rag_src)
+            rsend.click(on_rag_submit, [rmsg, rag_chat, rtemp], [rag_chat, rmsg]).then(update_rag_sources_display, None, rag_src)
+
+        # 이미지 분석
+        with gr.Tab("🖼️ 이미지 분석"):
+            vlm_model = gr.Dropdown([VLM_MODEL, "llava:latest"], value=VLM_MODEL, label="VLM 모델")
+            with gr.Tabs():
+                with gr.TabItem("단일 이미지"):
+                    with gr.Row():
+                        img_single = gr.Image(type="pil", label="이미지")
+                        with gr.Column():
+                            iprompt = gr.Textbox(label="프롬프트", value="이 이미지를 설명해주세요.", lines=3)
+                            irefine = gr.Checkbox(label="LLM으로 정제", value=True)
+                            itemp = gr.Slider(0.0, 1.0, value=0.7, label="Temperature")
+                            ibtn = gr.Button("분석", variant="primary")
+                    iout = gr.Textbox(label="분석 결과", lines=10)
+                    with gr.Accordion("VLM 원본", open=False):
+                        iraw = gr.Textbox(label="원본 결과")
+                    ibtn.click(handle_single_image_analysis, [img_single, iprompt, vlm_model, irefine, itemp], [iout, iraw])
+
+                with gr.TabItem("이미지 비교"):
+                    with gr.Row():
+                        img1 = gr.Image(type="pil", label="이미지 1")
+                        img2 = gr.Image(type="pil", label="이미지 2")
+                    cprompt = gr.Textbox(label="프롬프트", value="두 이미지를 비교해주세요.", lines=3)
+                    crefine = gr.Checkbox(label="LLM으로 정제", value=True)
+                    ctemp = gr.Slider(0.0, 1.0, value=0.7, label="Temperature")
+                    cbtn = gr.Button("비교", variant="primary")
+                    cout = gr.Textbox(label="비교 결과", lines=10)
+                    with gr.Accordion("VLM 원본", open=False):
+                        craw = gr.Textbox(label="원본 결과")
+                    cbtn.click(handle_image_comparison, [img1, img2, cprompt, vlm_model, crefine, ctemp], [cout, craw])
+
+        # 고급 생성기
+        with gr.Tab("🛠️ 고급 생성기"):
+            with gr.Tabs():
+                with gr.TabItem("Mermaid 다이어그램"):
+                    with gr.Row():
+                        with gr.Column():
+                            m_idea = gr.Textbox(label="아이디어", lines=5)
+                            m_type = gr.Dropdown(["flowchart","sequenceDiagram","gantt","pie","classDiagram"], value="flowchart", label="다이어그램 타입")
+                            m_llm = gr.Checkbox(value=True, label="LLM 사용")
+                            m_btn = gr.Button("생성", variant="primary")
+                        with gr.Column():
+                            m_out = gr.Markdown(label="렌더링")
+                            m_code = gr.Code(label="코드", language="markdown")
+                            m_status = gr.Textbox(label="상태")
+                    m_btn.click(handle_mermaid_generation, [m_idea, m_type, m_llm], [m_out, m_code, m_status])
+
+                with gr.TabItem("SD 프롬프트"):
+                    sd_idea = gr.Textbox(label="아이디어", lines=3)
+                    sd_btn = gr.Button("생성", variant="primary")
+                    sd_prompt = gr.Textbox(label="프롬프트", lines=4)
+                    sd_negative = gr.Textbox(label="네거티브 프롬프트", lines=2)
+                    sd_status = gr.Textbox(label="상태")
+                    sd_btn.click(handle_sd_prompt_generation, [sd_idea], [sd_prompt, sd_negative, sd_status])
+
+                with gr.TabItem("구조화 OCR"):
+                    ocr_img = gr.Image(type="pil", label="이미지")
+                    ocr_use_llm = gr.Checkbox(value=True, label="LLM으로 구조화")
+                    ocr_btn = gr.Button("OCR 실행", variant="primary")
+                    with gr.Row():
+                        ocr_overlay = gr.Image(label="인식 영역")
+                        ocr_df = gr.Dataframe(label="구조화 데이터")
+                    with gr.Accordion("텍스트 및 JSON", open=False):
+                        ocr_text = gr.Textbox(label="텍스트")
+                        ocr_json = gr.Code(label="JSON", language="json")
+                    ocr_btn.click(handle_structured_ocr, [ocr_img, ocr_use_llm], [ocr_overlay, ocr_text, ocr_df, ocr_json])
+
+        # 웹 & 도구
+        with gr.Tab("🌐 웹 & 도구"):
+            wq = gr.Textbox(label="웹 검색 질문", lines=2)
+            wt = gr.Slider(0.0, 1.0, value=0.7, label="Temperature")
+            wb = gr.Button("검색 및 답변", variant="primary")
+            wa = gr.Textbox(label="답변", lines=10)
+            with gr.Accordion("검색 정보", open=False):
+                wr = gr.Textbox(label="검색 결과")
+                wl = gr.Textbox(label="참조 URL")
+            wb.click(handle_web_rag, [wq, wt], [wa, wr, wl])
+
+        # 순차적 사고
+        with gr.Tab("🤔 순차적 사고"):
+            sq = gr.Textbox(label="질문", lines=3)
+            st = gr.Slider(0.0, 1.0, value=0.7, label="Temperature")
+            sb = gr.Button("사고 시작", variant="primary")
+            s_status = gr.Textbox(label="상태")
+            with gr.Row():
+                s_a = gr.Markdown(label="분석")
+                s_ans = gr.Markdown(label="답변")
+                s_ref = gr.Markdown(label="검증")
+            sb.click(handle_sequential_thinking, [sq, st], [s_a, s_ans, s_ref, s_status])
+
+    return demo
+
+# =============================
+# 메인 실행
+# =============================
+if __name__ == "__main__":
+    print("🚀 Gradio 앱 실행 중...")
+    app = build_ui()
+    # ▼ Gradio 4.x: queue 인자 축소(호환)
+    app = app.queue(max_size=32)
+    # share=False 가 터널링 지연을 줄여 훨씬 빠름
+    app.launch(server_name="0.0.0.0", server_port=7860, inbrowser=True, share=False, show_error=True)
