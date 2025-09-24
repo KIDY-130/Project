@@ -1,4 +1,3 @@
-
 #09
 import fitz  # PyMuPDF (pip install pymupdf)
 import os

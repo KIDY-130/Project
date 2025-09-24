@@ -1,4 +1,3 @@
-
 #12
 import base64
 import gradio as gr

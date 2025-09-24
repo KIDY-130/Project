@@ -1,4 +1,4 @@
-#63 o
+#63 
 """
 목표: 기존 OpenAI 기반 LangChain RAG 코드를 오픈소스 LLM(DeepSeek-R1) + Ollama + Gradio UI 로 변환
 
