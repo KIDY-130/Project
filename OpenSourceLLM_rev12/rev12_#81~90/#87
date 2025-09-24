@@ -1,0 +1,514 @@
+#87
+"""
+OpenCode 변환본
+- OpenAI 전용 코드(gpt-4o, API Key, chat.completions 등)를
+  오픈소스 LLM(DeepSeek-R1 @ Ollama)로 1:1에 가깝게 치환하고,
+  Gradio GUI로 여러 예제를 한 번에 실행할 수 있게 구성했습니다.
+
+✅ 완전 로컬: API Key 불필요 / .env 불필요 / 인터넷 불필요
+✅ 모델: deepseek-r1 (변경 가능, 다른 로컬 태그 사용 가능)
+✅ 스트리밍 출력, n(다중 후보), stop 시퀀스, temperature/top_p 비교
+✅ (유사) 페널티 실험: Ollama의 repeat_penalty로 근사(주의사항 아래 참조)
+✅ 안전 옵션: 셸 명령 실행 탭은 기본 “실행 금지” 상태(로컬에서 본인 책임으로만)
+
+사전 준비
+1) Ollama 설치: https://ollama.com
+2) 모델 다운로드(최초 1회):  `ollama pull deepseek-r1`
+3) 파이썬 패키지:             `pip install gradio ollama`
+
+중요 주의
+- DeepSeek-R1은 내부 추론을 <think>...</think>로 출력할 수 있습니다.
+  본 앱은 해당 블록을 자동 제거하여 사용자에겐 숨깁니다.
+- OpenAI의 frequency_penalty / presence_penalty는 Ollama에서 동일하지 않습니다.
+  여기서는 repeat_penalty를 가변 적용하여 “반복 억제”를 근사합니다.
+  (모델/버전에 따라 무시되거나 체감이 다를 수 있습니다.)
+"""
+
+from __future__ import annotations
+import re
+import time
+import json
+import subprocess
+from typing import List, Dict, Any, Generator, Optional, Tuple
+
+import gradio as gr
+import ollama
+
+
+# ==============================
+# 공통 유틸
+# ==============================
+_THINK_TAG = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+def strip_think(text: str) -> str:
+    """DeepSeek-R1이 출력하는 내부 추론(<think>...</think>)을 숨깁니다."""
+    return _THINK_TAG.sub("", text).strip()
+
+def ollama_complete(
+    messages: List[Dict[str, str]],
+    model: str = "deepseek-r1",
+    max_tokens: int = 256,
+    temperature: float = 0.7,
+    top_p: Optional[float] = None,
+    stop: Optional[List[str] | str] = None,
+    repeat_penalty: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    OpenAI chat.completions.create() 느낌의 단발 호출.
+    - Ollama options 주요 키: num_predict, temperature, top_p, stop, repeat_penalty
+    """
+    opts: Dict[str, Any] = {
+        "num_predict": int(max_tokens),
+        "temperature": float(temperature),
+    }
+    if top_p is not None:
+        opts["top_p"] = float(top_p)
+    if repeat_penalty is not None:
+        opts["repeat_penalty"] = float(repeat_penalty)
+    if stop:
+        opts["stop"] = stop
+
+    resp = ollama.chat(model=model, messages=messages, options=opts)
+    content = strip_think(resp.get("message", {}).get("content", ""))
+    usage = {
+        "prompt_tokens": resp.get("prompt_eval_count"),
+        "completion_tokens": resp.get("eval_count"),
+        "total_tokens": (resp.get("prompt_eval_count") or 0) + (resp.get("eval_count") or 0),
+        "total_duration_ns": resp.get("total_duration"),
+    }
+    return {
+        "message": {"role": "assistant", "content": content},
+        "usage": usage,
+        "model": resp.get("model", model),
+    }
+
+def ollama_stream(
+    messages: List[Dict[str, str]],
+    model: str = "deepseek-r1",
+    max_tokens: int = 256,
+    temperature: float = 0.7,
+    top_p: Optional[float] = None,
+    stop: Optional[List[str] | str] = None,
+    repeat_penalty: Optional[float] = None,
+) -> Generator[str, None, None]:
+    """스트리밍 생성기: 누적(clean) 텍스트를 계속 내보냅니다."""
+    opts: Dict[str, Any] = {
+        "num_predict": int(max_tokens),
+        "temperature": float(temperature),
+    }
+    if top_p is not None:
+        opts["top_p"] = float(top_p)
+    if repeat_penalty is not None:
+        opts["repeat_penalty"] = float(repeat_penalty)
+    if stop:
+        opts["stop"] = stop
+
+    stream = ollama.chat(model=model, messages=messages, stream=True, options=opts)
+    buffer = ""
+    for chunk in stream:
+        delta = chunk.get("message", {}).get("content", "")
+        if not delta:
+            continue
+        buffer += delta
+        clean = strip_think(buffer)
+        yield clean
+
+
+# ==============================
+# Gradio 앱
+# ==============================
+def build_app():
+    with gr.Blocks(title="OpenCode · DeepSeek-R1 (Local · Ollama)") as demo:
+        gr.Markdown(
+            """
+            # 🧠 OpenCode · DeepSeek-R1 (Local · Ollama)
+            OpenAI 예제를 로컬 오픈소스 LLM으로 변환한 멀티 데모입니다.  
+            **API Key 불필요 · .env 불필요 · 내부 추론(`<think>`) 자동 숨김**
+            """
+        )
+
+        with gr.Row():
+            model_tag = gr.Textbox(value="deepseek-r1", label="모델(로컬 태그)", interactive=True)
+            temperature = gr.Slider(0.0, 1.5, value=0.7, step=0.05, label="temperature")
+            top_p = gr.Slider(0.0, 1.0, value=1.0, step=0.05, label="top_p")
+            max_tokens = gr.Slider(16, 2048, value=256, step=1, label="max_tokens")
+
+        # ============ 탭 1: 기본 대화 ============
+        with gr.Tab("기본 대화"):
+            sys = gr.Textbox(label="system", value="당신은 이야기꾼입니다.")
+            usr = gr.Textbox(label="user", value="옛날 옛적에 ")
+            stops = gr.Textbox(label="stop (쉼표 구분)", value="\\n")
+            run = gr.Button("생성", variant="primary")
+            out = gr.Textbox(label="응답", lines=8, show_copy_button=True)
+            usage_box = gr.JSON(label="usage")
+
+            def on_basic(m, t, tp, mt, s, u, stops_csv):
+                stop_list = [x.strip() for x in stops_csv.split(",") if x.strip()]
+                resp = ollama_complete(
+                    messages=[{"role": "system", "content": s},
+                              {"role": "user", "content": u}],
+                    model=m, temperature=t, top_p=tp, max_tokens=int(mt),
+                    stop=stop_list or None,
+                )
+                return resp["message"]["content"], resp["usage"]
+
+            run.click(on_basic, [model_tag, temperature, top_p, max_tokens, sys, usr, stops], [out, usage_box])
+
+        # ============ 탭 2: temperature 비교 ============
+        with gr.Tab("temperature 비교"):
+            prefix = gr.Textbox(value="옛날 옛적에 ", label="프롬프트(prefix)")
+            run_temp = gr.Button("생성")
+            high = gr.Textbox(label="높음 (2.0)", lines=5, show_copy_button=True)
+            mid = gr.Textbox(label="중간 (1.0)", lines=5, show_copy_button=True)
+            low = gr.Textbox(label="낮음 (0.0)", lines=5, show_copy_button=True)
+
+            def on_temp(m, tp, mt, pfx):
+                def gen(temp):
+                    r = ollama_complete(
+                        messages=[{"role": "system", "content": "당신은 이야기꾼입니다."},
+                                  {"role": "user", "content": pfx}],
+                        model=m, temperature=temp, top_p=tp, max_tokens=int(mt),
+                        stop=["\n"]
+                    )["message"]["content"]
+                    return pfx + r
+                return gen(2.0), gen(1.0), gen(0.0)
+            run_temp.click(on_temp, [model_tag, top_p, max_tokens, prefix], [high, mid, low])
+
+        # ============ 탭 3: top_p 비교 ============
+        with gr.Tab("top_p 비교"):
+            prefix2 = gr.Textbox(value="옛날 옛적에 ", label="프롬프트(prefix)")
+            run_topp = gr.Button("생성")
+            topp1 = gr.Textbox(label="top_p=1.0", lines=5, show_copy_button=True)
+            topp05 = gr.Textbox(label="top_p=0.5", lines=5, show_copy_button=True)
+            topp01 = gr.Textbox(label="top_p=0.1", lines=5, show_copy_button=True)
+
+            def on_topp(m, t, mt, pfx):
+                def gen(tp):
+                    r = ollama_complete(
+                        messages=[{"role": "system", "content": "당신은 이야기꾼입니다."},
+                                  {"role": "user", "content": pfx}],
+                        model=m, temperature=t, top_p=tp, max_tokens=int(mt),
+                        stop=["\n"]
+                    )["message"]["content"]
+                    return pfx + r
+                return gen(1.0), gen(0.5), gen(0.1)
+            run_topp.click(on_topp, [model_tag, temperature, max_tokens, prefix2], [topp1, topp05, topp01])
+
+        # ============ 탭 4: (유사) 페널티 ============
+        with gr.Tab("반복 페널티(근사)"):
+            gr.Markdown("OpenAI의 frequency/presence_penalty 대신 **repeat_penalty**를 가변 적용해 반복을 억제합니다.")
+            pfx3 = gr.Textbox(value="옛날 옛적에 ", label="프롬프트(prefix)")
+            run_pen = gr.Button("생성")
+            high_rep = gr.Textbox(label="repeat_penalty=1.8 (강한 억제)", lines=5, show_copy_button=True)
+            low_rep = gr.Textbox(label="repeat_penalty=1.0 (기본)", lines=5, show_copy_button=True)
+
+            def on_pen(m, t, tp, mt, pfx):
+                def gen(rp):
+                    r = ollama_complete(
+                        messages=[{"role":"system","content":"당신은 이야기꾼입니다."},
+                                  {"role":"user","content":pfx}],
+                        model=m, temperature=t, top_p=tp, max_tokens=int(mt),
+                        repeat_penalty=rp
+                    )["message"]["content"]
+                    return pfx + r
+                return gen(1.8), gen(1.0)
+            run_pen.click(on_pen, [model_tag, temperature, top_p, max_tokens, pfx3], [high_rep, low_rep])
+
+        # ============ 탭 5: n개 후보 ============
+        with gr.Tab("다중 후보(n)"):
+            gr.Markdown("한 프롬프트에 대해 여러 후보를 연속 호출로 생성합니다.")
+            pfx4 = gr.Textbox(value="옛날 옛적에 ", label="프롬프트(prefix)")
+            n_choices = gr.Slider(1, 6, value=2, step=1, label="n")
+            run_n = gr.Button("생성")
+            out_n = gr.Textbox(label="후보들", lines=12, show_copy_button=True)
+
+            def on_n(m, t, tp, mt, pfx, n):
+                results = []
+                for i in range(int(n)):
+                    r = ollama_complete(
+                        messages=[{"role":"system","content":"당신은 이야기꾼입니다."},
+                                  {"role":"user","content":pfx}],
+                        model=m, temperature=t, top_p=tp, max_tokens=int(mt), stop=["\n"]
+                    )["message"]["content"]
+                    results.append(f"Choice {i}:\n{pfx}{r}")
+                return "\n\n".join(results)
+
+            run_n.click(on_n, [model_tag, temperature, top_p, max_tokens, pfx4, n_choices], out_n)
+
+        # ============ 탭 6: 스트리밍 ============
+        with gr.Tab("스트리밍"):
+            pfx5 = gr.Textbox(value="옛날 옛적에 ", label="프롬프트(prefix)")
+            btn_stream = gr.Button("스트리밍 시작")
+            stream_box = gr.Textbox(label="실시간 출력", lines=10)
+
+            def do_stream(m, t, tp, mt, pfx):
+                stream_box.value = pfx
+                msgs = [
+                    {"role":"system","content":"당신은 이야기꾼입니다."},
+                    {"role":"user","content":pfx}
+                ]
+                buffer = pfx
+                for clean in ollama_stream(msgs, m, int(mt), float(t), float(tp), stop=["\n"]):
+                    inc = clean
+                    stream_box.value = inc  # 전체 누적을 그대로 보여줌
+                    yield gr.update(value=inc)
+                    time.sleep(0.01)
+
+            btn_stream.click(do_stream, [model_tag, temperature, top_p, max_tokens, pfx5], [stream_box])
+
+        # ============ 탭 7: 키워드/해시태그 파이프라인 ============
+        with gr.Tab("키워드/해시태그 파이프라인"):
+            text_kw = gr.Textbox(label="입력 텍스트", lines=6, value="한 기발한 마을에서...")
+            btn_kw = gr.Button("키워드 추출 → 해시태그 생성")
+            kw_out = gr.Textbox(label="키워드(모델 응답)", lines=6, show_copy_button=True)
+            hash_out = gr.Textbox(label="해시태그 제안", lines=3, show_copy_button=True)
+
+            def on_kw(m, t, tp, mt, txt):
+                # 1) 키워드
+                kw = ollama_complete(
+                    messages=[
+                        {"role":"system","content":"중요 키워드를 JSON 배열로 출력하세요."},
+                        {"role":"user","content":txt}
+                    ],
+                    model=m, temperature=0.1, top_p=tp, max_tokens=200
+                )["message"]["content"]
+                # 2) 해시태그
+                hs = ollama_complete(
+                    messages=[
+                        {"role":"system","content":"주어진 키워드에서 해시태그 3~5개를 만들어주세요."},
+                        {"role":"user","content":kw}
+                    ],
+                    model=m, temperature=t, top_p=tp, max_tokens=60, stop=["\n"]
+                )["message"]["content"]
+                return kw, hs
+
+            btn_kw.click(on_kw, [model_tag, temperature, top_p, max_tokens, text_kw], [kw_out, hash_out])
+
+        # ============ 탭 8: 암호화폐 정보 템플릿 ============
+        with gr.Tab("암호화폐 정보(템플릿)"):
+            coin = gr.Textbox(label="코인 이름", value="Bitcoin")
+            btn_coin = gr.Button("생성")
+            coin_out = gr.Textbox(label="설명", lines=12, show_copy_button=True)
+            gr.Markdown("> 주의: 가격/최고가 등 최신 수치는 모델이 부정확할 수 있습니다. (본 앱은 인터넷 검색을 수행하지 않습니다)")
+
+            def on_coin(m, t, tp, mt, name):
+                msgs = [
+                    {"role":"system","content":"너는 스마트 어시스턴트다. 아래 형식을 따르되, 모호하면 안전하게 unknown으로 표기해라."},
+                    {"role":"assistant","content":"- 생성연도: \n- 공식 사이트: \n- 최신 가격: \n- 최고가: \n- 최저가: \n"},
+                    {"role":"user","content":name}
+                ]
+                r = ollama_complete(messages=msgs, model=m, temperature=t, top_p=tp, max_tokens=int(mt))
+                return r["message"]["content"]
+            btn_coin.click(on_coin, [model_tag, temperature, top_p, max_tokens, coin], coin_out)
+
+        # ============ 탭 9: 해시태그 추출 → 트윗 생성 ============
+        with gr.Tab("해시태그 → 트윗"):
+            src = gr.Textbox(label="본문", lines=8, value="좋은 친구는 ...")
+            btn_tweet = gr.Button("트윗 생성")
+            tweet_out = gr.Textbox(label="트윗(≤280자)", lines=6, show_copy_button=True)
+
+            def on_tweet(m, t, tp, mt, body):
+                hashtags = ollama_complete(
+                    messages=[{"role":"system","content":"텍스트에서 관련 해시태그 3~5개 추출"},
+                              {"role":"user","content":body}],
+                    model=m, temperature=0.2, top_p=tp, max_tokens=60
+                )["message"]["content"]
+                tweet = ollama_complete(
+                    messages=[{"role":"system","content":"주어진 해시태그로 100~280자 트윗 작성"},
+                              {"role":"user","content":f"{body}\n{hashtags}"}],
+                    model=m, temperature=t, top_p=tp, max_tokens=280, stop=["\n"]
+                )["message"]["content"]
+                # 280자 이내 보정
+                return tweet[:280]
+            btn_tweet.click(on_tweet, [model_tag, temperature, top_p, max_tokens, src], tweet_out)
+
+        # ============ 탭 10: 두 단계 랩 가사 ============
+        with gr.Tab("두 단계 랩 가사"):
+            btn_rap = gr.Button("생성")
+            rap_ctx = gr.Textbox(label="1단계 요약/배경", lines=6, show_copy_button=True)
+            rap_out = gr.Textbox(label="2단계 올드스쿨 랩 가사", lines=12, show_copy_button=True)
+
+            def on_rap(m, t, tp, mt):
+                ctx = ollama_complete(
+                    messages=[{"role":"system","content":"올드스쿨 랩의 가사적 특징과 주제를 간결 정리"},
+                              {"role":"user","content":"한 단락으로 정리"}],
+                    model=m, temperature=0.3, top_p=tp, max_tokens=200
+                )["message"]["content"]
+                lyric = ollama_complete(
+                    messages=[{"role":"system","content":"너는 유명한 올드스쿨 랩 작사가"},
+                              {"role":"user","content":f"배경: {ctx}\n\n정의와 평등에 대한 올드스쿨 랩 가사를 써줘."}],
+                    model=m, temperature=t, top_p=tp, max_tokens=500
+                )["message"]["content"]
+                return ctx, lyric
+            btn_rap.click(on_rap, [model_tag, temperature, top_p, max_tokens], [rap_ctx, rap_out])
+
+        # ============ 탭 11: 품사 판별(여러 문장) ============
+        with gr.Tab("품사 판별"):
+            prompts = gr.Textbox(label="문장들", lines=10, value=
+                "The light is red.\n"
+                "This desk is very light.\n"
+                "You light up my life.\n"
+                "He stepped light on the snow."
+            )
+            btn_pos = gr.Button("판별")
+            pos_out = gr.Textbox(label="응답", lines=10, show_copy_button=True)
+
+            def on_pos(m, t, tp, mt, txt):
+                lines = [s.strip() for s in txt.splitlines() if s.strip()]
+                results = []
+                for s in lines:
+                    r = ollama_complete(
+                        messages=[{"role":"system","content":"단어 'light'의 품사를 영어로 1~2단어로 답하라 (noun/adj/verb/adv 등)"},
+                                  {"role":"user","content":s}],
+                        model=m, temperature=0.0, top_p=tp, max_tokens=40
+                    )["message"]["content"]
+                    results.append(f"{s} -> {r}")
+                return "\n".join(results)
+            btn_pos.click(on_pos, [model_tag, temperature, top_p, max_tokens, prompts], pos_out)
+
+        # ============ 탭 12: few-shot 분류 ============
+        with gr.Tab("Few-shot 분류 (Apple)"):
+            few_in = gr.Dropdown(choices=["프롬프트 A", "프롬프트 B"], value="프롬프트 A", label="케이스")
+            btn_fs = gr.Button("분류")
+            fs_out = gr.Textbox(label="응답", lines=6, show_copy_button=True)
+
+            def on_fs(m, t, tp, mt, which):
+                if which == "프롬프트 A":
+                    prompt = (
+                        "Huawei:\ncompany\n\nGoogle:\ncompany\n\nMicrosoft:\ncompany\nApple:\n"
+                    )
+                else:
+                    prompt = (
+                        "Huawei:\ncompany\n\nGoogle:\ncompany\n\nMicrosoft:\ncompany\n\nApricot:\nFruit\n\nApple:\n"
+                    )
+                r = ollama_complete(
+                    messages=[{"role":"system","content":"너는 스마트한 어시스턴트"},
+                              {"role":"user","content":prompt}],
+                    model=m, temperature=0.0, top_p=tp, max_tokens=40
+                )["message"]["content"]
+                return r.strip()
+            btn_fs.click(on_fs, [model_tag, temperature, top_p, max_tokens, few_in], fs_out)
+
+        # ============ 탭 13: DevOps (Dockerfile/K8s) ============
+        with gr.Tab("DevOps 생성"):
+            sel = gr.Dropdown(choices=["Python Dockerfile", "MySQL K8s 배포"], value="Python Dockerfile")
+            btn_dev = gr.Button("생성")
+            dev_out = gr.Code(label="결과", language="yaml", lines=18)
+
+            def on_dev(m, t, tp, mt, kind):
+                if kind == "Python Dockerfile":
+                    prompt = (
+                        "# Node.js용 Dockerfile:\n"
+                        "FROM node:14\nWORKDIR /app\nCOPY . /app\nRUN npm install\n"
+                        "EXPOSE 8080\nCMD [\"node\", \"app.js\"]\n"
+                        "# Python용 Dockerfile:\n"
+                    )
+                else:
+                    prompt = (
+                        "# Redis용 Kubernetes 배포:\n"
+                        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: redis-deployment\n"
+                        "spec:\n  selector:\n    matchLabels:\n      app: redis\n  template:\n    metadata:\n      labels:\n        app: redis\n"
+                        "    spec:\n      containers:\n      - name: redis\n        image: redis\n        ports:\n        - containerPort: 6379\n"
+                        "# MySQL용 Kubernetes 배포:\n"
+                    )
+                r = ollama_complete(
+                    messages=[{"role":"system","content":"구성 스크립트를 깔끔히 작성하는 DevOps 어시스턴트"},
+                              {"role":"user","content":prompt}],
+                    model=m, temperature=0.2, top_p=tp, max_tokens=400
+                )["message"]["content"]
+                return r.strip()
+            btn_dev.click(on_dev, [model_tag, temperature, top_p, max_tokens, sel], dev_out)
+
+        # ============ 탭 14: TODO 생성 (stop 시퀀스) ============
+        with gr.Tab("TODO 생성 (stop)"):
+            n_tasks = gr.Slider(1, 20, value=5, step=1, label="할 일 개수 n")
+            btn_todo = gr.Button("생성")
+            todo_out = gr.Textbox(label="결과", lines=12, show_copy_button=True)
+
+            def on_todo(m, t, tp, mt, n):
+                n = int(n)
+                prompt = (
+                    "Please create a todo list for establishing a company in the United States.\n"
+                    "Each task should be written in one line.\n"
+                    "Task 1: [task 1]\nTask 2: [task 2]\nTask 3: [task 3]\n...\nTask n: [task n]\n"
+                )
+                stop = [f"Task {n+1}:", "assistant:", "user:"]
+                r = ollama_complete(
+                    messages=[{"role":"system","content":"You are a smart assistant."},
+                              {"role":"user","content":prompt}],
+                    model=m, temperature=t, top_p=tp, max_tokens=max(60, n*50), stop=stop
+                )["message"]["content"]
+                return r
+            btn_todo.click(on_todo, [model_tag, temperature, top_p, max_tokens, n_tasks], todo_out)
+
+        # ============ 탭 15: 셸 명령 제안(옵션 실행) ============
+        with gr.Tab("셸 명령 제안 (주의)"):
+            gr.Markdown("**위험 경고**: 실제 명령 실행은 로컬 시스템에 영향을 줄 수 있습니다. 기본값은 실행 금지입니다.")
+            allow_exec = gr.Checkbox(label="실행 허용(본인 책임)", value=False)
+            hist = gr.Textbox(label="대화 히스토리(프롬프트 체인)", lines=12, value=
+                "System: 당신은 스마트한 어시스턴트입니다. 답변은 명령줄의 내용만 해 주세요.\n"
+                "User: 현재 디렉토리의 모든 파일을 나열해 주세요.\n"
+                "Assistant: ls -l\n"
+                "User: 숨김 파일 포함하여 나열해 주세요.\n"
+                "Assistant: ls -la\n"
+                "User: 파일 'test.txt'에서 'sun' 단어 개수 세어 주세요.\n"
+                "Assistant: grep -o 'sun' test.txt | wc -l\n"
+            )
+            user_q = gr.Textbox(label="질문", value="현재 디렉토리의 파일 수를 세어주세요.")
+            btn_cmd = gr.Button("명령 제안 → (선택)실행")
+            cmd_out = gr.Textbox(label="제안된 명령", lines=2, show_copy_button=True)
+            exec_out = gr.Textbox(label="실행 결과(stdout/stderr)", lines=8, show_copy_button=True)
+
+            def on_cmd(m, t, tp, mt, hx, q, allow):
+                # 간단한 few-shot 명령 생성
+                prompt = f"{hx}\nUser: {q}\nAssistant:"
+                r = ollama_complete(
+                    messages=[{"role":"system","content":"답변은 쉘 한 줄 명령만."},
+                              {"role":"user","content":prompt}],
+                    model=m, temperature=0.0, top_p=tp, max_tokens=60
+                )["message"]["content"].strip()
+                executed = ""
+                if allow:
+                    try:
+                        res = subprocess.run(r, shell=True, capture_output=True, text=True, timeout=30)
+                        executed = res.stdout + ("\n[stderr]\n"+res.stderr if res.stderr else "")
+                    except Exception as e:
+                        executed = f"[실행 오류] {e}"
+                else:
+                    executed = "(실행 금지됨)"
+                return r, executed
+
+            btn_cmd.click(on_cmd, [model_tag, temperature, top_p, max_tokens, hist, user_q, allow_exec], [cmd_out, exec_out])
+
+        # ============ 모델 목록 ============
+        with gr.Tab("모델 목록"):
+            btn_list = gr.Button("ollama list")
+            list_out = gr.JSON(label="설치된 모델")
+
+            def on_list():
+                return ollama.list()
+            btn_list.click(on_list, outputs=list_out)
+
+        gr.Markdown(
+            """
+            ### 매핑 요약 (OpenAI → Ollama)
+            - `OpenAI(api_key=...)` → **불필요** (로컬 추론)
+            - `client.chat.completions.create` → `ollama.chat` 래핑(위 함수들)
+            - `model="gpt-4o(-mini)"` → `model="deepseek-r1"` (로컬 태그로 교체)
+            - `max_tokens` → `num_predict`
+            - `temperature`, `top_p`, `stop` → 동일 의미
+            - `n`(다중 후보) → 연속 호출로 구현
+            - `frequency/presence_penalty` → **repeat_penalty**로 근사(모델에 따라 체감 상이)
+            """
+        )
+    return demo
+
+
+# ==============================
+# 메인
+# ==============================
+if __name__ == "__main__":
+    app = build_app()
+    # 외부 접속 필요 없으면 server_name 생략 가능
+    app.launch(server_name="0.0.0.0", server_port=7860, show_error=True)
+

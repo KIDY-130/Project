@@ -1,0 +1,279 @@
+#79
+"""
+Gemini 멀티모달(이미지/오디오/비디오) 예제를
+로컬 오픈소스 스택(Ollama + DeepSeek-R1, LLaVA/Qwen-VL, Faster-Whisper)과 Gradio GUI로 변환한 스크립트.
+
+■ 전제
+- 로컬 PC에 Ollama 설치 및 실행 중 (기본: http://localhost:11434)
+- 텍스트 추론: deepseek-r1 (예: `ollama pull deepseek-r1`)
+- 비전 모델(이미지/비디오 프레임 설명): LLaVA, Llama 3.2 Vision, Qwen2.5-VL 등 중 하나 설치
+  (예: `ollama pull llava:latest` 또는 `ollama pull llama3.2-vision` 또는 `ollama pull qwen2.5-vl`)
+- 오디오(ASR): Faster-Whisper 로컬 추론 (최초 실행 시 모델 다운로드)
+- 외부 API키 미사용, 100% 로컬 동작
+
+■ 제공 기능 (원본 기능과 매핑)
+1) 이미지 질의: 이미지 + 질문 -> 비전 모델이 설명/분류(원문의 generate_content([image, prompt]))
+2) 오디오 요약/전사: 음성 내용 간단 유추 + 원문 전사(원문의 audio 처리)
+3) 비디오 설명: 동영상을 업로드하면 키프레임 추출 후 비전 모델로 요약(원문의 video 설명)
+4) 텍스트 후처리/요약: DeepSeek-R1로 한국어 정리/요약(선택)
+5) Gradio GUI 탭: Image / Audio / Video
+
+작성: OpenCode
+"""
+
+# ========================
+# 의존 패키지 설치(필요 시 자동 설치)
+# ========================
+try:
+    import ollama
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "ollama"])
+    import ollama
+
+try:
+    import gradio as gr
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "gradio>=4.44.0"])  
+    import gradio as gr
+
+try:
+    import cv2
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "opencv-python"])
+    import cv2
+
+try:
+    from faster_whisper import WhisperModel
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "faster-whisper"])
+    from faster_whisper import WhisperModel
+
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+import os, json, tempfile, math
+
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+# ========================
+# Ollama 헬퍼
+# ========================
+
+def ollama_chat(model: str, prompt: str, images: Optional[List[str]] = None, 
+                system: str = "", options: Optional[dict] = None) -> str:
+    """Ollama Chat API 래퍼. images: 파일 경로 리스트(비전 모델에서 사용)."""
+    client = ollama.Client(host=OLLAMA_HOST)
+    msgs = []
+    if system:
+        msgs.append({"role": "system", "content": system})
+    msg = {"role": "user", "content": prompt}
+    if images:
+        # Ollama는 message-level에 images 필드 허용
+        msg["images"] = images
+    msgs.append(msg)
+
+    res = client.chat(model=model, messages=msgs, options=options or {})
+    return res.get("message", {}).get("content", "")
+
+# ========================
+# Faster-Whisper(ASR)
+# ========================
+@dataclass
+class ASRConfig:
+    model_size: str = "small"  # tiny/base/small/medium/large-v3 등
+    device: str = "auto"       # "auto", "cpu", "cuda"
+    compute_type: str = "auto" # "int8", "int8_float16", "float16", "int8" 등
+
+class ASR:
+    def __init__(self, cfg: ASRConfig):
+        self.cfg = cfg
+        self.model = WhisperModel(cfg.model_size, device=cfg.device, compute_type=cfg.compute_type)
+
+    def transcribe(self, audio_path: str, language: Optional[str] = None) -> str:
+        """오디오 전사. language=None이면 자동 감지."""
+        segments, info = self.model.transcribe(audio_path, language=language)
+        text = " ".join(s.text.strip() for s in segments)
+        return text.strip()
+
+# ========================
+# 비디오 유틸: 키프레임(또는 등간격 프레임) 추출
+# ========================
+
+def extract_frames(video_path: str, every_n_seconds: float = 2.0, max_frames: int = 12) -> List[str]:
+    """동영상에서 일정 간격으로 프레임 추출 후 파일 경로 리스트 반환."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError("비디오를 열 수 없습니다: " + video_path)
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / max(fps, 1e-5)
+
+    interval = max(every_n_seconds, 0.5)
+    frame_ids = []
+    for t in [i*interval for i in range(0, int(math.ceil(duration/interval)) + 1)]:
+        f = int(t * fps)
+        if f < total_frames:
+            frame_ids.append(f)
+    # 프레임 수 제한
+    frame_ids = frame_ids[:max_frames]
+
+    out_paths = []
+    with tempfile.TemporaryDirectory() as td:
+        # 임시 디렉토리 내에 저장 후 복사(Gradio 반환용) -> 여기서는 간단히 /tmp 경로 재사용
+        pass
+    # 임시 디렉토리는 함수 종료 시 사라지므로, 실제 저장은 고정 temp dir에 하자
+    persist = tempfile.mkdtemp(prefix="frames_")
+
+    for idx, fid in enumerate(frame_ids):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fid)
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        outp = os.path.join(persist, f"frame_{idx:03d}.jpg")
+        cv2.imwrite(outp, frame)
+        out_paths.append(outp)
+
+    cap.release()
+    return out_paths
+
+# ========================
+# 고수준 태스크
+# ========================
+
+def describe_image(vision_model: str, image_path: str, question_ko: str = "이것은 무슨 이미지입니까?") -> str:
+    prompt = (
+        "당신은 시각 묘사 전문가입니다. 한국어로 간결하고 정확하게 답하세요.\n" 
+        f"질문: {question_ko}\n"
+        "가능하면 핵심 키워드도 3~5개 제시하세요."
+    )
+    return ollama_chat(vision_model, prompt, images=[image_path])
+
+
+def infer_audio(audio_path: str, asr: ASR, summarizer_model: Optional[str] = None) -> Tuple[str, Optional[str]]:
+    """오디오 전사 + (선택) 요약/주제 유추."""
+    transcript = asr.transcribe(audio_path)
+    summary = None
+    if summarizer_model:
+        prompt = (
+            "다음 전사 텍스트의 주제와 요점을 한국어로 3~5문장으로 요약하세요.\n"
+            "- 핵심 키워드 5개\n- 청중 대상(있다면)\n- 톤/스타일\n\n전사:\n" + transcript
+        )
+        summary = ollama_chat(summarizer_model, prompt)
+    return transcript, summary
+
+
+def describe_video(vision_model: str, video_path: str, seconds_interval: float = 2.0, max_frames: int = 12) -> str:
+    frames = extract_frames(video_path, seconds_interval, max_frames)
+    if not frames:
+        return "프레임을 추출하지 못했습니다. 다른 동영상을 시도하거나 간격을 늘려보세요."
+
+    prompt = (
+        "당신은 비디오 설명가입니다. 첨부된 프레임들을 시간 순서로 보고, 하나의 영상이라고 가정하고 한국어로 묘사하세요.\n"
+        "- 전체 줄거리/행동\n- 장면 전환/변화 포인트\n- 등장 인물/사물\n- 분위기/장르\n- 5개 내외 핵심 키워드\n"
+    )
+    # 일부 비전 모델은 이미지 여러 장을 허용. Ollama는 images=[...]
+    return ollama_chat(vision_model, prompt, images=frames)
+
+# ========================
+# Gradio UI
+# ========================
+DEFAULT_TEXT_MODEL = os.environ.get("OC_TEXT_MODEL", "deepseek-r1")
+DEFAULT_VISION_MODEL = os.environ.get("OC_VISION_MODEL", "llava:latest")
+
+asr_engine: Optional[ASR] = None
+
+with gr.Blocks(title="OpenCode • 멀티모달(이미지/오디오/비디오) - 로컬") as demo:
+    gr.Markdown("""
+    # 🧩 OpenCode • 멀티모달 (로컬 전용)
+    - 텍스트 추론: **DeepSeek-R1** (Ollama)
+    - 비전: **LLaVA / Llama3.2-Vision / Qwen2.5-VL** 중 선택 (Ollama)
+    - 음성인식: **Faster-Whisper** (로컬)
+    - 외부 API/키 **불필요**
+    """)
+
+    with gr.Row():
+        txt_model = gr.Textbox(value=DEFAULT_TEXT_MODEL, label="텍스트 모델(요약/후처리)")
+        vis_model = gr.Textbox(value=DEFAULT_VISION_MODEL, label="비전 모델(이미지/비디오)")
+        with gr.Column():
+            asr_size = gr.Dropdown(["tiny", "base", "small", "medium", "large-v3"], value="small", label="ASR 모델 크기 (Faster-Whisper)")
+            asr_dev = gr.Dropdown(["auto", "cpu", "cuda"], value="auto", label="ASR 디바이스")
+            asr_ctype = gr.Dropdown(["auto", "int8", "int8_float16", "float16"], value="auto", label="ASR 연산정밀도")
+            init_asr_btn = gr.Button("ASR 초기화", variant="secondary")
+            asr_status = gr.Markdown("ASR 엔진: 초기화 필요")
+
+    def init_asr(size, dev, ctype):
+        global asr_engine
+        asr_engine = ASR(ASRConfig(model_size=size, device=dev, compute_type=ctype))
+        return "✅ ASR 엔진 준비 완료"
+
+    init_asr_btn.click(init_asr, [asr_size, asr_dev, asr_ctype], asr_status)
+
+    with gr.Tabs():
+        # ---------- 이미지
+        with gr.Tab("Image Q&A"):
+            img = gr.Image(type="filepath", label="이미지 업로드")
+            question = gr.Textbox(value="이것은 무슨 이미지입니까?", label="질문")
+            run_img = gr.Button("이미지 질의 실행", variant="primary")
+            out_img = gr.Markdown()
+
+            def on_image(vmodel, image_path, q):
+                if not image_path:
+                    return "이미지를 업로드하세요."
+                return describe_image(vmodel, image_path, q)
+
+            run_img.click(on_image, [vis_model, img, question], out_img)
+
+        # ---------- 오디오
+        with gr.Tab("Audio: 요약 & 전사"):
+            au = gr.Audio(type="filepath", label="오디오 업로드 (wav/mp3 등)")
+            with gr.Row():
+                do_summary = gr.Checkbox(value=True, label="요약/주제 유추 수행(DeepSeek-R1)")
+                run_au = gr.Button("오디오 처리", variant="primary")
+            out_summary = gr.Markdown(label="요약")
+            out_trans = gr.Textbox(label="전사", lines=10)
+
+            def on_audio(tmodel, audio_path, want_summary):
+                if asr_engine is None:
+                    return "ASR 엔진을 먼저 초기화하세요.", ""
+                if not audio_path:
+                    return "오디오 파일을 업로드하세요.", ""
+                transcript, summary = infer_audio(audio_path, asr_engine, tmodel if want_summary else None)
+                return (summary or "요약(비활성화)"), transcript
+
+            run_au.click(on_audio, [txt_model, au, do_summary], [out_summary, out_trans])
+
+        # ---------- 비디오
+        with gr.Tab("Video 설명"):
+            vd = gr.Video(label="비디오 업로드")
+            with gr.Row():
+                sec = gr.Slider(0.5, 5.0, value=2.0, step=0.5, label="프레임 간격(초)")
+                mxf = gr.Slider(4, 24, value=12, step=1, label="최대 프레임 수")
+            run_v = gr.Button("비디오 설명 생성", variant="primary")
+            out_v = gr.Markdown()
+
+            def on_video(vmodel, video_path, s, mf):
+                if not video_path:
+                    return "비디오 파일을 업로드하세요."
+                return describe_video(vmodel, video_path, s, int(mf))
+
+            run_v.click(on_video, [vis_model, vd, sec, mxf], out_v)
+
+    gr.Markdown("""
+    ---
+    ### 사용 팁
+    - 비전 모델 예시: `llava:latest`, `llama3.2-vision`, `qwen2.5-vl` (로컬에 pull 필요)
+    - DeepSeek-R1은 텍스트 정리/요약에 사용(비전 자체는 위 모델들이 수행)
+    - Faster-Whisper는 첫 실행 시 모델을 다운로드하므로 시간이 걸릴 수 있습니다.
+    - 긴 동영상은 프레임 간격을 늘리거나 최대 프레임 수를 줄이세요.
+    """)
+
+if __name__ == "__main__":
+    # 로컬 서비스 시작
+    demo.launch(server_name="0.0.0.0", server_port=7861, share=False)
+
+# ollama pull deepseek-r1
+# ollama pull llava:latest 

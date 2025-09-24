@@ -1,0 +1,365 @@
+#86
+"""
+OpenCode 변환본
+- OpenAI 전용 코드(ENV, OpenAI 클라이언트, gpt-4o-mini 등)를
+  오픈소스 LLM(DeepSeek-R1 @ Ollama) + Gradio GUI로 동작하도록 변환했습니다.
+- ✅ 완전 로컬: API Key 불필요, .env 불필요
+- ✅ OpenAI chat.completions.create 와 유사한 인터페이스 제공
+- ✅ stop 시퀀스, max_tokens, temperature, usage(토큰/스텝 유사치) 표시
+- ✅ 여러 데모 탭: 기본 대화, 길이 비교, stop 사용, 접두어, JSON 예시, 모델 목록
+
+사전 준비
+1) Ollama 설치: https://ollama.com
+2) 모델 받기(최초 1회):  `ollama pull deepseek-r1`
+3) 파이썬 패키지:       `pip install gradio ollama`
+"""
+
+import re
+import time
+from typing import List, Dict, Any, Generator, Optional, Tuple
+
+import gradio as gr
+import ollama  # 로컬 Ollama 서버(기본 http://localhost:11434)
+
+
+# ==============================
+# DeepSeek-R1의 <think> 내부 추론 숨김 유틸
+# ==============================
+_THINK_TAG = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+def strip_think(text: str) -> str:
+    """DeepSeek-R1이 출력하는 내부 추론(<think>...</think>)을 숨깁니다."""
+    return _THINK_TAG.sub("", text).strip()
+
+
+# ==============================
+# OpenAI 호환 느낌의 클라이언트 래퍼
+# ==============================
+class LocalOpenSourceClient:
+    """
+    OpenAI의 `client.chat.completions.create(...)`를 흉내 내는 간단 래퍼.
+    - messages: [{"role": "system"|"user"|"assistant", "content": "..."}]
+    - model: 기본 'deepseek-r1'
+    - options: max_tokens(num_predict), temperature, stop(list|str) 등
+    - 반환: {"message": {"content": ...}, "usage": {...}} 형태의 dict
+    """
+
+    def __init__(self, model: str = "deepseek-r1"):
+        self.model = model
+
+    def chat_complete(
+        self,
+        messages: List[Dict[str, str]],
+        model: Optional[str] = None,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        stop: Optional[List[str] | str] = None,
+    ) -> Dict[str, Any]:
+        """
+        비(非)스트리밍 호출. OpenAI chat.completions.create 대체.
+        """
+        model = model or self.model
+
+        resp = ollama.chat(
+            model=model,
+            messages=messages,
+            options={
+                "num_predict": int(max_tokens),
+                "temperature": float(temperature),
+                **({"stop": stop} if stop else {}),
+            },
+        )
+        # Ollama 표준 응답 예:
+        # {
+        #   "model": "deepseek-r1",
+        #   "message": {"role":"assistant","content":"..."},
+        #   "prompt_eval_count": 123,
+        #   "eval_count": 256,
+        #   "total_duration": ... (ns)
+        # }
+        content_raw = resp.get("message", {}).get("content", "")
+        content = strip_think(content_raw)
+        usage = {
+            # OpenAI의 usage를 흉내냄: 프롬프트, 생성 토큰 근사치
+            "prompt_tokens": resp.get("prompt_eval_count"),
+            "completion_tokens": resp.get("eval_count"),
+            "total_tokens": (
+                (resp.get("prompt_eval_count") or 0) + (resp.get("eval_count") or 0)
+            ),
+            # 참고용 시간 정보(나노초)
+            "total_duration_ns": resp.get("total_duration"),
+        }
+        return {
+            "message": {"role": "assistant", "content": content},
+            "usage": usage,
+            "model": resp.get("model", model),
+        }
+
+    def chat_stream(
+        self,
+        messages: List[Dict[str, str]],
+        model: Optional[str] = None,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        stop: Optional[List[str] | str] = None,
+    ) -> Generator[str, None, None]:
+        """
+        스트리밍 생성기. 토큰/청크 단위로 문자열을 yield 합니다.
+        """
+        model = model or self.model
+
+        stream = ollama.chat(
+            model=model,
+            messages=messages,
+            stream=True,
+            options={
+                "num_predict": int(max_tokens),
+                "temperature": float(temperature),
+                **({"stop": stop} if stop else {}),
+            },
+        )
+
+        buffer = ""
+        for chunk in stream:
+            delta = chunk.get("message", {}).get("content", "")
+            if not delta:
+                continue
+            buffer += delta
+            # 내부 추론 제거 후 증분만 내보내기
+            clean = strip_think(buffer)
+            yield clean
+
+    # OpenAI의 client.models.list() 유사
+    def models_list(self) -> List[Dict[str, Any]]:
+        li = ollama.list()  # {'models': [{'name': 'deepseek-r1', ...}, ...]}
+        return li.get("models", [])
+
+    def model_ids(self) -> List[str]:
+        return [m.get("name") for m in self.models_list() if m.get("name")]
+
+
+# 전역 클라이언트(기본 모델: deepseek-r1)
+client = LocalOpenSourceClient(model="deepseek-r1")
+
+
+# ==============================
+# Gradio 앱
+# ==============================
+def build_app():
+    with gr.Blocks(title="DeepSeek-R1 (Local · Ollama) — OpenCode 변환") as demo:
+        gr.Markdown(
+            """
+            # 🧠 DeepSeek-R1 (로컬 · Ollama) — OpenCode 변환
+            - OpenAI 코드 예시를 로컬 오픈소스 LLM으로 1:1에 가깝게 바꾼 데모입니다.
+            - **API Key 불필요**, `.env` 불필요, 내부 추론(`<think>`) 자동 숨김.
+            """
+        )
+
+        # ============ 탭 1: 기본 대화 ============
+        with gr.Tab("기본 대화 (system/user)"):
+            with gr.Row():
+                model = gr.Textbox(value="deepseek-r1", label="모델 태그", interactive=True)
+                temp = gr.Slider(0.0, 1.5, value=0.7, step=0.05, label="temperature")
+                max_toks = gr.Slider(16, 2048, value=256, step=1, label="max_tokens")
+            sys = gr.Textbox(label="system", value="당신은 똑똑하고 창의적인 AI입니다.")
+            usr = gr.Textbox(label="user", value="안녕하세요!")
+            run = gr.Button("생성")
+            out = gr.Textbox(label="응답", lines=8, show_copy_button=True)
+            usage_box = gr.JSON(label="usage")
+
+            def on_basic(m, t, mt, s, u):
+                resp = client.chat_complete(
+                    messages=[
+                        {"role": "system", "content": s},
+                        {"role": "user", "content": u},
+                    ],
+                    model=m, temperature=float(t), max_tokens=int(mt),
+                )
+                return resp["message"]["content"], resp["usage"]
+
+            run.click(on_basic, [model, temp, max_toks, sys, usr], [out, usage_box])
+
+        # ============ 탭 2: 길이 비교(max_tokens) ============
+        with gr.Tab("길이 비교 (짧게 vs 길게)"):
+            sys2 = gr.Textbox(label="system", value="당신은 똑똑하고 창의적인 조수입니다.")
+            usr2 = gr.Textbox(label="user", value="한니발(Hannibal)은 누구인가요?")
+            mtag2 = gr.Textbox(value="deepseek-r1", label="모델 태그")
+            short_btn = gr.Button("짧게 생성 (max_tokens=50)")
+            long_btn = gr.Button("약간 길게 생성 (max_tokens=300)")
+            short_out = gr.Textbox(label="짧은 응답", lines=8, show_copy_button=True)
+            long_out = gr.Textbox(label="약간 긴 응답", lines=12, show_copy_button=True)
+
+            def gen_len(m, sys_msg, user_msg, mt):
+                r = client.chat_complete(
+                    messages=[{"role": "system", "content": sys_msg},
+                              {"role": "user", "content": user_msg}],
+                    model=m, max_tokens=int(mt), temperature=0.7
+                )
+                return r["message"]["content"]
+
+            short_btn.click(gen_len, [mtag2, sys2, usr2, gr.Number(50)], short_out)
+            long_btn.click(gen_len, [mtag2, sys2, usr2, gr.Number(300)], long_out)
+
+        # ============ 탭 3: stop 시퀀스 ============
+        with gr.Tab("stop 시퀀스"):
+            mtag3 = gr.Textbox(value="deepseek-r1", label="모델 태그")
+            sys3 = gr.Textbox(label="system", value="당신은 똑똑하고 창의적인 조수입니다.")
+            usr3 = gr.Textbox(label="user", value="한니발(Hannibal)은 누구인가요?")
+            stop_str = gr.Textbox(label="stop (쉼표로 구분)", value=".\n,Human:,AI:")
+            mt3 = gr.Slider(16, 1024, value=200, step=1, label="max_tokens")
+            run3 = gr.Button("생성(중단 시퀀스 적용)")
+            out3 = gr.Textbox(label="응답", lines=10, show_copy_button=True)
+
+            def on_stop(m, s, u, stop_csv, mt):
+                stops = [x.strip() for x in stop_csv.split(",") if x.strip()]
+                r = client.chat_complete(
+                    messages=[{"role": "system", "content": s},
+                              {"role": "user", "content": u}],
+                    model=m, max_tokens=int(mt), stop=stops
+                )
+                return r["message"]["content"]
+
+            run3.click(on_stop, [mtag3, sys3, usr3, stop_str, mt3], out3)
+
+        # ============ 탭 4: 접두어(prefix) ============
+        with gr.Tab("접두어 + 질문"):
+            mtag4 = gr.Textbox(value="deepseek-r1", label="모델 태그")
+            prefix = gr.Textbox(value="\n\n1. ", label="접두어(prefix)")
+            usr4 = gr.Textbox(label="user", value="세계 7대 불가사의는 무엇일까요?")
+            run4 = gr.Button("생성")
+            out4 = gr.Textbox(label="응답", lines=10, show_copy_button=True)
+
+            def on_prefix(m, pfx, u):
+                r = client.chat_complete(
+                    messages=[{"role": "user", "content": f"{u}{pfx}"}],
+                    model=m
+                )
+                return pfx + r["message"]["content"]
+
+            run4.click(on_prefix, [mtag4, prefix, usr4], out4)
+
+        # ============ 탭 5: JSON 예시(소수) ============
+        with gr.Tab("JSON 응답(프롬프트 체인)"):
+            gr.Markdown("LLM에게 JSON 형태로 답을 요구하는 예시(원본 프롬프트 체인 유사).")
+            mtag5 = gr.Textbox(value="deepseek-r1", label="모델 태그")
+            prompt5 = gr.Textbox(
+                label="요청",
+                value="다음을 포함하는 JSON형 반환: 11과 65 사이의 소수(Prime numbers)"
+            )
+            run5 = gr.Button("생성")
+            out5 = gr.Code(label="JSON 후보(LLM 응답 원문)", language="json")
+
+            def on_json(m, p):
+                r = client.chat_complete(
+                    messages=[{"role": "user", "content": p}],
+                    model=m, temperature=0.2,  # 더 구조적 응답 유도
+                    max_tokens=300
+                )
+                return r["message"]["content"]
+
+            run5.click(on_json, [mtag5, prompt5], out5)
+
+        # ============ 탭 6: 모델 목록 ============
+        with gr.Tab("모델 목록(ollama list)"):
+            mlist_btn = gr.Button("모델 나열")
+            mlist_json = gr.JSON(label="ollama.list() 원본")
+            mids_btn = gr.Button("모델 ID만")
+            mids_txt = gr.Textbox(label="IDs", lines=8, show_copy_button=True)
+
+            def on_list():
+                return {"models": client.models_list()}
+
+            def on_ids():
+                return "\n".join(client.model_ids())
+
+            mlist_btn.click(on_list, outputs=mlist_json)
+            mids_btn.click(on_ids, outputs=mids_txt)
+
+        # ============ 탭 7: 스트리밍 채팅 ============
+        with gr.Tab("스트리밍 채팅"):
+            mtag7 = gr.Textbox(value="deepseek-r1", label="모델 태그")
+            sys7 = gr.Textbox(value="당신은 유용하고 정중한 한국어 어시스턴트입니다.", label="system")
+            temp7 = gr.Slider(0.0, 1.5, value=0.7, step=0.05, label="temperature")
+            mt7 = gr.Slider(16, 2048, value=256, step=1, label="max_tokens")
+            chat = gr.ChatInterface(
+                fn=lambda history, message, m, s, t, mt: stream_adapter(history, message, m, s, t, mt),
+                additional_inputs=[mtag7, sys7, temp7, mt7],
+                title="로컬 LLM 스트리밍",
+                chatbot=gr.Chatbot(height=420, show_copy_button=True, likeable=True),
+                textbox=gr.Textbox(placeholder="메시지를 입력하세요...", lines=2),
+                cache_examples=False,
+                clear_btn="대화 지우기",
+                retry_btn=None,
+                undo_btn=None,
+            )
+
+        gr.Markdown(
+            """
+            ### 참고: OpenAI → 로컬 매핑
+            - `OpenAI(api_key=...)` → (불필요) 로컬 실행
+            - `client.chat.completions.create(...)` → `LocalOpenSourceClient.chat_complete(...)`
+            - `model="gpt-4o-mini"` → `model="deepseek-r1"`(또는 설치한 다른 로컬 모델 태그)
+            - `max_tokens` → `num_predict` 로 대응
+            - `temperature` 동일
+            - `stop=["...", "..."]` 동일
+            - `response.usage` → `prompt_eval_count`/`eval_count`로 근사
+            """
+        )
+
+    return demo
+
+
+def stream_adapter(
+    history: List[Tuple[str, str]],
+    message: str,
+    model: str,
+    system: str,
+    temperature: float,
+    max_tokens: int,
+):
+    """
+    Gradio ChatInterface용 스트리밍 어댑터.
+    내부적으로 전체 히스토리를 재구성해도 되지만,
+    여기서는 최근 user 1턴만 모델에 전달(간단화).
+    """
+    history = history + [(message, "")]
+    msgs = []
+    if system.strip():
+        msgs.append({"role": "system", "content": system})
+    msgs.append({"role": "user", "content": message})
+
+    buffer = ""
+    for clean in client.chat_stream(
+        messages=msgs,
+        model=model,
+        temperature=float(temperature),
+        max_tokens=int(max_tokens),
+    ):
+        # clean은 전체 누적(clean) 텍스트. 증분만 보여주기.
+        inc = clean[len(buffer):]
+        buffer = clean
+        if inc:
+            history[-1] = (message, buffer)
+            yield history, None
+        time.sleep(0.01)
+    history[-1] = (message, buffer)
+    yield history, None
+
+
+# ==============================
+# 스크립트 실행
+# ==============================
+if __name__ == "__main__":
+    # CLI 예시(원하면 주석 해제)
+    # resp = client.chat_complete(
+    #     messages=[{"role": "system", "content": "당신은 시를 잘 쓰는 AI입니다."},
+    #               {"role": "user", "content": "AI에 대한 시를 하나 작성해줘"}],
+    #     max_tokens=200, temperature=0.7
+    # )
+    # print(resp["message"]["content"])
+    app = build_app()
+    app.launch(server_name="0.0.0.0", server_port=7860, show_error=True)
+
+
+
+

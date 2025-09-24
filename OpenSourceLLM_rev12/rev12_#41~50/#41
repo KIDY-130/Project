@@ -1,0 +1,210 @@
+
+#41
+"""
+로컬 LLM (Ollama + DeepSeek-R1) 스트리밍 챗봇 - Gradio UI
+- 기존 OpenAI chat.completions(stream=True) 콘솔 REPL을
+  로컬 Ollama HTTP API 기반 스트리밍 + Gradio 웹 UI로 변환
+- 의존성: pip install gradio requests
+- 사전 준비:
+  1) Ollama 설치 및 실행 (기본 포트 11434)
+  2) deepseek-r1 모델 설치:  `ollama pull deepseek-r1`
+실행:
+  python app.py
+"""
+
+import json
+import requests
+import gradio as gr
+from typing import List, Dict, Generator, Optional
+
+# Ollama 서버 기본 엔드포인트
+OLLAMA_URL = "http://localhost:11434/api/chat"
+
+# 기본 모델명 (원하면 UI에서 변경 가능)
+DEFAULT_MODEL = "deepseek-r1"
+
+
+# ---- 유틸 함수들 ----
+
+def build_messages(system_prompt: str, history: List[Dict[str, str]], user_text: str) -> List[Dict[str, str]]:
+    """
+    Ollama /api/chat 형식의 messages 배열 생성
+    - role: 'system' | 'user' | 'assistant'
+    - content: 문자열
+    """
+    messages = []
+    if system_prompt.strip():
+        messages.append({"role": "system", "content": system_prompt.strip()})
+
+    for turn in history:
+        messages.append({"role": turn["role"], "content": turn["content"]})
+
+    messages.append({"role": "user", "content": user_text})
+    return messages
+
+
+def ollama_chat_stream(
+    messages: List[Dict[str, str]],
+    model: str = DEFAULT_MODEL,
+    temperature: float = 0.2,
+    top_p: float = 0.95,
+    max_tokens: Optional[int] = None,
+) -> Generator[str, None, None]:
+    """
+    Ollama /api/chat 스트리밍 호출 (Server-Sent JSON lines)
+    - stream=True 일 때, 각 라인은 JSON이며 {"message": {"content": "..."}, "done": bool} 등의 필드를 포함
+    - 토큰 단위로 content를 이어붙여 yield
+    """
+    payload = {
+        "model": model,
+        "stream": True,
+        "messages": messages,
+        "options": {
+            "temperature": temperature,
+            "top_p": top_p,
+        },
+    }
+    if max_tokens is not None:
+        payload["options"]["num_predict"] = max_tokens  # Ollama는 max_tokens 대신 num_predict 사용
+
+    with requests.post(OLLAMA_URL, json=payload, stream=True) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if data.get("done"):
+                break
+
+            delta = (
+                data.get("message", {}).get("content", "")
+                or data.get("delta", "")
+            )
+            if delta:
+                yield delta
+
+
+# ---- Gradio 핸들러 ----
+
+def gradio_chat_stream(
+    user_text: str,
+    chat_history_ui: List[Dict[str, str]],
+    system_prompt: str,
+    model: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: Optional[int],
+    internal_history: List[Dict[str, str]],
+):
+    """
+    Gradio 스트리밍 핸들러
+    - chat_history_ui: [{"role":"user"/"assistant", "content":"..."}] 형태 (Chatbot 표시용)
+    - internal_history: [{"role":"user"/"assistant", "content":"..."}] 문맥 유지용
+    """
+    chat_history_ui = chat_history_ui or []
+    # UI용: 사용자 메시지 + 빈 봇 응답 추가
+    chat_history_ui.append({"role": "user", "content": user_text})
+    chat_history_ui.append({"role": "assistant", "content": ""})
+
+    # 내부 대화 이력 준비
+    messages = build_messages(system_prompt, internal_history or [], user_text)
+
+    acc = ""
+
+    try:
+        for delta in ollama_chat_stream(
+            messages=messages,
+            model=model or DEFAULT_MODEL,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens if max_tokens and max_tokens > 0 else None,
+        ):
+            acc += delta
+            chat_history_ui[-1]["content"] = acc  # 최신 assistant 업데이트
+            yield chat_history_ui, internal_history
+    except requests.RequestException as e:
+        err = f"[연결 오류] Ollama 서버에 연결할 수 없습니다: {e}"
+        chat_history_ui[-1]["content"] = err
+        yield chat_history_ui, internal_history
+        return
+
+    # 내부 이력 업데이트
+    internal_history = internal_history or []
+    internal_history.append({"role": "user", "content": user_text})
+    internal_history.append({"role": "assistant", "content": acc})
+
+    yield chat_history_ui, internal_history
+
+
+def clear_history():
+    """대화 이력 초기화"""
+    return [], []
+
+
+# ---- Gradio UI 구성 ----
+
+with gr.Blocks(title="DeepSeek-R1 스트리밍 챗봇 (Ollama)") as demo:
+    gr.Markdown("## 💬 DeepSeek-R1 스트리밍 챗봇 (Ollama 기반)")
+    gr.Markdown(
+        "- 좌측 설정에서 **시스템 프롬프트/모델/온도/토큰 수**를 조절할 수 있습니다.\n"
+        "- 대화는 **로컬에서만** 처리되며, API 키가 필요 없습니다.\n"
+        "- 기존 콘솔 REPL의 `quit` 대신, 상단의 **대화 초기화** 버튼을 사용하세요."
+    )
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            with gr.Accordion("⚙️ 설정", open=True):
+                system_prompt = gr.Textbox(
+                    label="시스템 프롬프트",
+                    value="사용자의 요구에 따라 적절한 답변을 제공해주세요.",
+                    lines=4,
+                )
+                model = gr.Textbox(
+                    label="모델명",
+                    value=DEFAULT_MODEL,
+                    placeholder="예: deepseek-r1, qwen2.5, llama3 등",
+                )
+                with gr.Row():
+                    temperature = gr.Slider(0.0, 1.5, value=0.2, step=0.05, label="temperature")
+                    top_p = gr.Slider(0.1, 1.0, value=0.95, step=0.05, label="top_p")
+                max_tokens = gr.Number(
+                    label="num_predict (최대 토큰 수, 빈 값이면 제한 없음)",
+                    value=None,
+                    precision=0
+                )
+                clear_btn = gr.Button("🧹 대화 초기화", variant="secondary")
+
+        with gr.Column(scale=2):
+            chatbot = gr.Chatbot(height=480, type="messages", avatar_images=(None, None))
+            user_input = gr.Textbox(
+                label="메시지 입력",
+                placeholder="예: Python 재귀 피보나치 예제 코드 작성해줘",
+                lines=2,
+            )
+            send_btn = gr.Button("전송 🚀", variant="primary")
+
+    internal_history = gr.State([])
+
+    send_event = send_btn.click(
+        fn=gradio_chat_stream,
+        inputs=[user_input, chatbot, system_prompt, model, temperature, top_p, max_tokens, internal_history],
+        outputs=[chatbot, internal_history],
+        queue=True,
+        api_name="chat",
+    )
+    user_input.submit(
+        fn=gradio_chat_stream,
+        inputs=[user_input, chatbot, system_prompt, model, temperature, top_p, max_tokens, internal_history],
+        outputs=[chatbot, internal_history],
+        queue=True,
+    )
+
+    send_event.then(lambda: "", None, user_input)
+    clear_btn.click(fn=clear_history, outputs=[chatbot, internal_history])
+
+if __name__ == "__main__":
+    demo.launch()

@@ -1,0 +1,326 @@
+#82
+"""
+Gemini 파인튜닝 예제 → 로컬 오픈소스 LLM 파인튜닝(QLoRA) + Gradio 변환
+
+▣ 목표
+- API 키 없이 100% 로컬에서 학습/추론
+- DeepSeek-R1 계열 공개 체크포인트(예: deepseek-r1-distill-qwen-7b)로 **SFT(지도학습)** 수행
+- **QLoRA(4bit)** + **PEFT** 로 VRAM 절감
+- 학습 데이터는 CSV(train.csv) 의 (text_input, output) 2열 구조를 사용
+- 학습 후 어댑터(LoRA)로 추론 및 Gradio 데모 제공
+
+▣ 사전 준비
+- Python 3.10+
+- GPU 권장(최소 12~16GB VRAM; CPU도 가능하나 매우 느림)
+- 로컬에 모델을 내려받으며, 외부 API는 사용하지 않음
+
+▣ 참고
+- Ollama는 현재(2025-09 기준) 내부 미세튜닝보다는 모델 실행/서빙에 최적화되어 있습니다.
+  본 스크립트는 **Transformers+PEFT**로 로컬에서 미세튜닝을 수행하고, 추론은 Transformers로 바로 하거나,
+  (선택) 학습 결과를 병합/변환하여 Ollama용 GGUF로 내보내는 절차를 안내합니다.
+
+작성: OpenCode
+"""
+
+# =========================
+# 의존성 설치 (최초 1회 필요)
+# =========================
+try:
+    import torch, transformers, peft, datasets  # type: ignore
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", 
+        "torch", 
+        "transformers>=4.42.0", 
+        "peft>=0.11.0", 
+        "accelerate>=0.30.0", 
+        "bitsandbytes>=0.43.1", 
+        "datasets", 
+        "trl>=0.9.6", 
+        "gradio>=4.44.0", 
+        "pandas", 
+        "seaborn", 
+        "matplotlib"
+    ])
+
+import os, json, math, time, random
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from typing import List, Dict, Any
+
+import torch
+from datasets import Dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
+)
+from peft import LoraConfig, get_peft_model, PeftModel
+from trl import SFTTrainer, SFTConfig
+import gradio as gr
+
+# =========================
+# 경로/모델 설정
+# =========================
+@dataclass
+class TrainConfig:
+    base_model: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"  # 공개 체크포인트 예시
+    output_dir: str = "./sft_outputs"
+    run_name: str = f"r1_sft_{int(time.time())}"
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    target_modules: List[str] = None  # None → 일반적인 q_proj,k_proj,v_proj,o_proj 자동탐색 시도
+    lr: float = 1e-4
+    epochs: int = 3
+    per_device_train_batch_size: int = 2
+    gradient_accumulation_steps: int = 8
+    max_seq_len: int = 1024
+    warmup_ratio: float = 0.03
+    weight_decay: float = 0.0
+    fp16: bool = False
+    bf16: bool = True  # 최신 GPU(AMPERE+) 권장
+    use_4bit: bool = True  # QLoRA
+    packing: bool = True  # 여러 샘플을 한 시퀀스로 패킹해 효율↑
+
+
+CFG = TrainConfig()
+
+# =========================
+# 1) 학습 데이터 로딩 (CSV → Dataset)
+# -------------------------
+# CSV 포맷: text_input, output (헤더 포함)
+# Gemini 예제의 training_data 리스트와 동일 개념
+# =========================
+
+def load_csv_as_dataset(csv_path: str) -> Dataset:
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV 파일을 찾을 수 없습니다: {csv_path}")
+    df = pd.read_csv(csv_path)
+    # 컬럼명 표준화
+    if not {"text_input", "output"}.issubset(df.columns):
+        # 첫 두 열을 사용
+        cols = list(df.columns)
+        df = df.rename(columns={cols[0]: "text_input", cols[1]: "output"})
+    # 프롬프트 템플릿 구성
+    def format_example(row):
+        # 심플한 인스트럭션 포맷(필요 시 사용자 정의)
+        return (
+            "### 지시문:\n" + str(row["text_input"]).strip() + "\n\n" +
+            "### 응답:\n" + str(row["output"]).strip()
+        )
+    df["text"] = df.apply(format_example, axis=1)
+    ds = Dataset.from_pandas(df[["text"]])
+    return ds
+
+# =========================
+# 2) 모델/토크나이저 로딩 (4bit 양자화)
+# =========================
+
+def load_base_and_tokenizer(cfg: TrainConfig):
+    bnb_cfg = None
+    if cfg.use_4bit:
+        bnb_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16 if cfg.bf16 else torch.float16,
+        )
+    tok = AutoTokenizer.from_pretrained(cfg.base_model, use_fast=True)
+    # 일부 Qwen 계열은 pad 토큰 미정의 → eos로 채움
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    model = AutoModelForCausalLM.from_pretrained(
+        cfg.base_model,
+        quantization_config=bnb_cfg,
+        torch_dtype=torch.bfloat16 if cfg.bf16 else torch.float16,
+        device_map="auto",
+    )
+    return model, tok
+
+# =========================
+# 3) Trainer 설정 및 학습 실행
+# =========================
+
+def train(csv_path: str, cfg: TrainConfig = CFG) -> str:
+    ds = load_csv_as_dataset(csv_path)
+    model, tok = load_base_and_tokenizer(cfg)
+
+    # LoRA 구성
+    lora = LoraConfig(
+        r=cfg.lora_r,
+        lora_alpha=cfg.lora_alpha,
+        lora_dropout=cfg.lora_dropout,
+        target_modules=cfg.target_modules,  # None → 자동
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+
+    # SFT 트레이너
+    sft_cfg = SFTConfig(
+        output_dir=os.path.join(cfg.output_dir, cfg.run_name),
+        num_train_epochs=cfg.epochs,
+        per_device_train_batch_size=cfg.per_device_train_batch_size,
+        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+        learning_rate=cfg.lr,
+        lr_scheduler_type="cosine",
+        warmup_ratio=cfg.warmup_ratio,
+        weight_decay=cfg.weight_decay,
+        max_seq_length=cfg.max_seq_len,
+        bf16=cfg.bf16,
+        fp16=cfg.fp16,
+        logging_steps=10,
+        save_steps=200,
+        save_total_limit=3,
+        packing=cfg.packing,
+        report_to=[]  # wandb 등 미사용
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tok,
+        train_dataset=ds,
+        peft_config=lora,
+        args=sft_cfg,
+        formatting_func=lambda x: x["text"],
+        dataset_text_field=None,
+    )
+
+    trainer.train()
+
+    # 어댑터 저장
+    out_dir = os.path.join(cfg.output_dir, cfg.run_name)
+    trainer.model.save_pretrained(out_dir)
+    tok.save_pretrained(out_dir)
+
+    print(f"\n[완료] LoRA 어댑터 저장: {out_dir}")
+    return out_dir
+
+# =========================
+# 4) 학습 스냅샷/로스 곡선 시각화(선택)
+#   (TRL/SFTTrainer는 기본적으로 state.log_history 제공)
+# =========================
+
+def plot_loss_curve(trainer, save_path: str = None):
+    logs = trainer.state.log_history
+    df = pd.DataFrame([l for l in logs if "loss" in l])
+    if df.empty:
+        print("로깅된 loss가 없습니다.")
+        return None
+    plt.figure(figsize=(6,4))
+    sns.lineplot(data=df, x=df.index, y="loss")
+    plt.title("Training Loss")
+    plt.xlabel("Step")
+    plt.ylabel("Loss")
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight")
+        print("손실 곡선 저장:", save_path)
+    return df
+
+# =========================
+# 5) 추론(어댑터 로드)
+# =========================
+
+def load_for_inference(adapter_dir: str, cfg: TrainConfig = CFG):
+    base, tok = load_base_and_tokenizer(cfg)
+    model = PeftModel.from_pretrained(base, adapter_dir, device_map="auto")
+    model.eval()
+    return model, tok
+
+@torch.inference_mode()
+def generate(model, tok, prompt: str, max_new_tokens=256, temperature=0.7, top_p=0.9) -> str:
+    tpl = (
+        "### 지시문:\n" + prompt.strip() + "\n\n### 응답:\n"
+    )
+    inputs = tok(tpl, return_tensors="pt").to(model.device)
+    out = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=temperature,
+        top_p=top_p,
+        pad_token_id=tok.eos_token_id,
+    )
+    text = tok.decode(out[0], skip_special_tokens=True)
+    # 프롬프트 이후만 잘라 반환
+    return text.split("### 응답:\n", 1)[-1].strip()
+
+# =========================
+# 6) Gradio 데모
+# =========================
+with gr.Blocks(title="OpenCode • 로컬 SFT(QLoRA) 데모", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("""
+    # 🧪 OpenCode • 로컬 파인튜닝(QLoRA) + 추론 데모
+    - CSV(train.csv)의 `(text_input, output)` 페어로 **SFT** 수행
+    - 학습된 LoRA 어댑터를 로드해 추론
+    - 외부 API키 불필요 / 100% 로컬
+    """)
+
+    with gr.Tab("Train"):
+        csv_path = gr.Textbox(value="train.csv", label="학습 CSV 경로(text_input,output)")
+        run_btn = gr.Button("학습 시작", variant="primary")
+        train_status = gr.Textbox(label="상태", lines=8)
+        adapter_out = gr.Textbox(label="어댑터 경로")
+
+        def do_train(path):
+            try:
+                out = train(path, CFG)
+                return "✅ 학습 완료", out
+            except Exception as e:
+                return f"❌ 오류: {e}", ""
+
+        run_btn.click(do_train, [csv_path], [train_status, adapter_out])
+
+    with gr.Tab("Infer"):
+        adapter_dir = gr.Textbox(value="", label="학습된 어댑터 디렉터리")
+        load_btn = gr.Button("모델 로드")
+        sys_info = gr.Markdown("상태: 대기 중")
+        user_in = gr.Textbox(value="예) 123과 456의 합을 구하고, 설명까지 해줘", lines=3, label="프롬프트")
+        max_new = gr.Slider(32, 1024, value=256, step=32, label="max_new_tokens")
+        temp = gr.Slider(0.1, 1.5, value=0.7, step=0.05, label="temperature")
+        topp = gr.Slider(0.1, 1.0, value=0.9, step=0.05, label="top_p")
+        go_btn = gr.Button("생성")
+        out_md = gr.Markdown()
+
+        state_model = gr.State(value=None)
+        state_tok = gr.State(value=None)
+
+        def do_load(dirpath):
+            m, t = load_for_inference(dirpath, CFG)
+            return (m, t), "✅ 로드 완료"
+
+        load_btn.click(do_load, [adapter_dir], [state_model, state_tok, sys_info])
+
+        def do_gen(m, t, prompt, mx, te, tp):
+            if m is None or t is None:
+                return "먼저 모델을 로드하세요."
+            return generate(m, t, prompt, max_new_tokens=int(mx), temperature=float(te), top_p=float(tp))
+
+        go_btn.click(do_gen, [state_model, state_tok, user_in, max_new, temp, topp], out_md)
+
+    with gr.Tab("Utils"):
+        gr.Markdown("""
+        ### (선택) Ollama로 내보내기 가이드
+        1) 어댑터를 **base 모델에 병합** 후 저장
+        2) `llama.cpp` 변환 스크립트로 GGUF 생성
+        3) Modelfile 작성 후 `ollama create`로 등록
+
+        아래는 1) 병합 예시 코드 스니펫입니다.
+        """)
+        code = gr.Code(language="python", value='''
+from peft import PeftModel
+from transformers import AutoModelForCausalLM
+base = AutoModelForCausalLM.from_pretrained(CFG.base_model, torch_dtype=torch.bfloat16, device_map="auto")
+merged = PeftModel.from_pretrained(base, "./sft_outputs/.../", device_map="auto")
+merged = merged.merge_and_unload()  # LoRA 병합
+merged.save_pretrained("./merged_model")
+''')
+        gr.Markdown("병합된 `./merged_model`을 GGUF로 변환 후 Ollama에 등록하면 로컬 서빙이 가능합니다.")
+
+if __name__ == "__main__":
+    # Gradio 앱 구동
+    demo.launch(server_name="0.0.0.0", server_port=7864, share=False)
+
+

@@ -1,0 +1,283 @@
+#81
+"""
+Gemini Function Calling 예제 ➜ 로컬 오픈소스 LLM(Ollama + DeepSeek-R1)용 툴콜 데모
+- 외부 API 키 불필요, 100% 로컬
+- Ollama(Chat)로 모델 호출, 우리가 직접 "함수 호출(JSON) → 실행 → 결과 반영" 파이프라인 구현
+- Gradio UI로 모드(NONE/AUTO/ANY)와 허용 함수 선택 제공
+
+작성: OpenCode
+"""
+
+# ========================
+# 의존 패키지 설치(필요 시 자동)
+# ========================
+try:
+    import ollama
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "ollama"])
+    import ollama
+
+try:
+    import gradio as gr
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "gradio>=4.44.0"])  
+    import gradio as gr
+
+import json, re, math, time
+from typing import Dict, Any, List, Optional, Tuple, Union
+
+OLLAMA_HOST = "http://localhost:11434"
+DEFAULT_MODEL = "deepseek-r1"  # 필요 시 바꾸세요
+
+# ========================
+# 1) 예시 도구(함수)
+# ========================
+
+def add(a: float, b: float) -> float:
+    """returns a + b."""
+    return a + b
+
+
+def subtract(a: float, b: float) -> float:
+    """returns a - b."""
+    return a - b
+
+
+def multiply(a: float, b: float) -> float:
+    """returns a * b."""
+    return a * b
+
+
+def divide(a: float, b: float) -> float:
+    """returns a / b (0으로 나누기 방지)."""
+    if b == 0:
+        raise ValueError("0으로 나눌 수 없습니다.")
+    return a / b
+
+
+def get_temperature(location: str) -> str:
+    """get current temperature (더미)."""
+    if location == "서울":
+        return "20도"
+    elif location == "부산":
+        return "22도"
+    else:
+        return "10도"
+
+# 레지스트리: 이름→실제 함수
+FUNCTIONS: Dict[str, Any] = {
+    "add": add,
+    "subtract": subtract,
+    "multiply": multiply,
+    "divide": divide,
+    "get_temperature": get_temperature,
+}
+
+# 함수 시그니처 설명(프롬프트용)
+FUNCTION_SPECS: Dict[str, Dict[str, Any]] = {
+    "add": {"description": "returns a + b", "params": {"a": "number", "b": "number"}},
+    "subtract": {"description": "returns a - b", "params": {"a": "number", "b": "number"}},
+    "multiply": {"description": "returns a * b", "params": {"a": "number", "b": "number"}},
+    "divide": {"description": "returns a / b", "params": {"a": "number", "b": "number"}},
+    "get_temperature": {"description": "get current temperature (dummy)", "params": {"location": "string"}},
+}
+
+# ========================
+# 2) 모델 호출 래퍼
+# ========================
+
+def chat_once(model: str, messages: List[Dict[str, str]], *, json_mode: bool = False, temperature: float = 0.2) -> str:
+    """Ollama chat 호출. json_mode=True면 format='json' 시도 후 실패 시 일반 텍스트 파싱."""
+    client = ollama.Client(host=OLLAMA_HOST)
+    options = {"temperature": float(temperature)}
+    if json_mode:
+        options["format"] = "json"
+    try:
+        res = client.chat(model=model, messages=messages, options=options)
+        return res.get("message", {}).get("content", "")
+    except Exception as e:
+        return f"[model_error] {e}"
+
+# ========================
+# 3) 프롬프트: 함수 호출 프로토콜
+# ========================
+
+def build_tools_block(allowed: List[str]) -> str:
+    lines = []
+    for name in allowed:
+        spec = FUNCTION_SPECS[name]
+        params = ", ".join(f"{k}:{v}" for k, v in spec["params"].items())
+        lines.append(f"- {name}({params}) : {spec['description']}")
+    return "\n".join(lines)
+
+PROTO_EXAMPLE = {
+    "tool_call": {"name": "multiply", "args": {"a": 57, "b": 44}},
+    # 또는
+    # "final_answer": "문장으로 된 최종 답변"
+}
+
+SYSTEM_BASE = (
+    "너는 도구를 선택해 문제를 해결하는 조수다. 반드시 아래 JSON 스키마 중 하나로만 응답하라.\n"
+    "- 도구가 필요하면: {\"tool_call\": {\"name\": <string>, \"args\": <object>}}\n"
+    "- 도구가 필요 없으면: {\"final_answer\": <string>}\n"
+    "추가 텍스트/설명/코드블록 없이 JSON만 출력.\n"
+)
+
+# ========================
+# 4) 파서: JSON 또는 코드블록에서 JSON 추출
+# ========================
+
+def try_parse_json(text: str) -> Optional[Dict[str, Any]]:
+    text = text.strip()
+    # 코드펜스 제거
+    m = re.search(r"```(?:json)?\n(.*?)\n```", text, re.S | re.I)
+    if m:
+        text = m.group(1).strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        # 중괄호 스니펫만 추출 시도
+        m2 = re.search(r"\{[\s\S]*\}\s*$", text)
+        if m2:
+            try:
+                return json.loads(m2.group(0))
+            except Exception:
+                return None
+        return None
+
+# ========================
+# 5) 툴콜 실행 파이프라인
+# ========================
+class ToolMode:
+    NONE = "none"   # 함수 사용 금지
+    AUTO = "auto"   # 모델이 자유롭게 선택
+    ANY = "any"     # 일부 함수만 허용
+
+
+def run_tool_call(user_prompt: str, *, mode: str, allowed_tools: Optional[List[str]] = None, model: str = DEFAULT_MODEL, temperature: float = 0.2) -> Dict[str, Any]:
+    """유저 입력→(옵션) 함수 호출→최종 답변 생성까지 수행하고 디버그 정보를 반환."""
+    allowed = []
+    if mode == ToolMode.NONE:
+        # 도구 없이 곧바로 답변
+        sys_prompt = SYSTEM_BASE + "\n지금은 도구 사용을 금지한다. 반드시 {\"final_answer\": ...} 형태로만 답하라."
+    elif mode == ToolMode.ANY:
+        allowed = [n for n in (allowed_tools or []) if n in FUNCTIONS]
+        if not allowed:
+            return {"error": "허용 함수가 비어있습니다."}
+        sys_prompt = SYSTEM_BASE + "\n사용 가능한 도구 목록:\n" + build_tools_block(allowed)
+    else:  # AUTO
+        allowed = list(FUNCTIONS.keys())
+        sys_prompt = SYSTEM_BASE + "\n사용 가능한 도구 목록:\n" + build_tools_block(allowed)
+
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    # 1단계: 모델에게 JSON 의사결정 요청
+    model_raw = chat_once(model, messages, json_mode=True, temperature=temperature)
+    parsed = try_parse_json(model_raw) or {}
+
+    debug_steps: List[Dict[str, Any]] = [
+        {"step": "model_decision", "raw": model_raw, "parsed": parsed}
+    ]
+
+    # 2단계: 도구 호출 또는 최종답변
+    if "tool_call" in parsed:
+        call = parsed["tool_call"]
+        name = call.get("name")
+        args = call.get("args", {}) if isinstance(call, dict) else {}
+        if name not in allowed:
+            return {"error": f"허용되지 않은 함수 호출 시도: {name}", "debug": debug_steps}
+        if name not in FUNCTIONS:
+            return {"error": f"알 수 없는 함수: {name}", "debug": debug_steps}
+        # 실제 함수 실행
+        try:
+            result = FUNCTIONS[name](**args)
+        except Exception as e:
+            result = f"[tool_error] {e}"
+        debug_steps.append({"step": "tool_execute", "name": name, "args": args, "result": result})
+
+        # 3단계: 함수 결과를 주고 최종 답변 생성
+        follow_messages = messages + [
+            {"role": "assistant", "content": json.dumps({"tool_call": {"name": name, "args": args}}, ensure_ascii=False)},
+            {"role": "user", "content": f"함수 `{name}` 의 실행 결과는 다음과 같다.\nRESULT: {result}\n이 결과를 이용해 질문에 최종 답을 한국어로 간결히 작성하라."},
+        ]
+        final_text = chat_once(model, follow_messages, json_mode=False, temperature=temperature)
+        debug_steps.append({"step": "final_answer", "text": final_text})
+        return {"answer": final_text, "debug": debug_steps}
+
+    elif "final_answer" in parsed:
+        return {"answer": parsed.get("final_answer", ""), "debug": debug_steps}
+
+    else:
+        # 모델이 JSON 규약을 어긴 경우: 원문 그대로 반환
+        return {"answer": model_raw, "debug": debug_steps, "warning": "JSON 파싱 실패 또는 프로토콜 위반"}
+
+# ========================
+# 6) Gradio UI
+# ========================
+with gr.Blocks(title="OpenCode • 로컬 툴콜(Function Calling)") as demo:
+    gr.Markdown("""
+    # 🛠️ OpenCode • 로컬 툴콜(Function Calling) 데모
+    - 모델: **DeepSeek-R1** (Ollama)
+    - 모드: `none`(함수 금지) / `auto`(전체 허용) / `any`(일부 허용)
+    - JSON 프로토콜로 함수 선택 → 실제 파이썬 함수 실행 → 결과 반영
+    """)
+
+    with gr.Row():
+        mode = gr.Radio(["none", "auto", "any"], value="auto", label="Function Mode")
+        allowed = gr.CheckboxGroup(list(FUNCTIONS.keys()), value=["multiply", "get_temperature"], label="허용 함수(any 모드에서 사용)")
+        model_name = gr.Textbox(value=DEFAULT_MODEL, label="모델명(Ollama)")
+        temp = gr.Slider(0.0, 1.5, value=0.2, step=0.05, label="temperature")
+
+    with gr.Tabs():
+        with gr.Tab("Quick Math"):
+            q1 = gr.Textbox(value="저는 57마리의 고양이를 키우고 있고, 각 44개의 손싸개를 가지고 있습니다. 손싸개는 총 몇 개 일까요?", lines=2, label="질문")
+            run1 = gr.Button("실행", variant="primary")
+            out1 = gr.Markdown(label="답변")
+            dbg1 = gr.JSON(label="디버그")
+
+            def go1(m, alw, mdl, t):
+                res = run_tool_call(m, mode=m, allowed_tools=alw, model=mdl, temperature=t)
+                return res.get("answer", ""), res
+
+            run1.click(go1, [mode, allowed, model_name, temp], [out1, dbg1])
+
+        with gr.Tab("Weather"):
+            q2 = gr.Textbox(value="현재 서울과 부산의 기온은?", label="질문")
+            gr.Markdown("참고: 예제 함수는 개별 호출만 지원하므로 모델이 한 번에 두 도시를 처리하도록 후속 프롬프트에서 합성합니다.")
+            run2 = gr.Button("실행")
+            out2 = gr.Markdown()
+            dbg2 = gr.JSON()
+
+            def go2(q, m, alw, mdl, t):
+                res = run_tool_call(q, mode=m, allowed_tools=alw, model=mdl, temperature=t)
+                return res.get("answer", ""), res
+
+            run2.click(go2, [q2, mode, allowed, model_name, temp], [out2, dbg2])
+
+        with gr.Tab("Free Chat + Tools"):
+            q3 = gr.Textbox(value="아무거나 물어보세요. 필요 시 도구를 사용합니다.", lines=2, label="질문")
+            run3 = gr.Button("실행")
+            out3 = gr.Markdown()
+            dbg3 = gr.JSON()
+            run3.click(lambda q, m, alw, mdl, t: (r:=run_tool_call(q, mode=m, allowed_tools=alw, model=mdl, temperature=t)).get("answer", ""), [q3, mode, allowed, model_name, temp], out3)
+            run3.click(lambda q, m, alw, mdl, t: run_tool_call(q, mode=m, allowed_tools=alw, model=mdl, temperature=t), [q3, mode, allowed, model_name, temp], dbg3)
+
+    gr.Markdown("""
+    ---
+    ### 사용 팁
+    - `none`: 모델이 계산을 스스로 설명/답변(도구 사용 안 함)
+    - `auto`: 등록된 모든 도구 중에서 모델이 선택
+    - `any`: 체크된 도구만 사용 가능(화이트리스트)
+    - 모델이 JSON을 어길 수 있어 견고한 파서(코드블록/스니펫 추출)로 보완했습니다.
+    - 필요 시 여러 함수 호출도 확장 가능합니다(현재 샘플은 1회 호출 기준).
+    """)
+
+if __name__ == "__main__":
+    demo.launch(server_name="0.0.0.0", server_port=7863, share=False)
+
+

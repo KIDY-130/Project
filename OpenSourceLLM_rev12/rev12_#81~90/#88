@@ -1,0 +1,466 @@
+#88
+"""
+OpenCode 변환본: Whisper + DeepSeek-R1(Ollama) + Gradio GUI 올인원 파이썬 스크립트
+----------------------------------------------------------------------------------
+이 스크립트는 다음의 'Closed LLM' 의존 코드를 모두 **오픈소스 로컬 환경**으로 대체합니다.
+
+- OpenAI API (gpt-4o, whisper-1)  -> ❌ 제거
+- Gradio 기반의 간단/확장형 GUI 제공 -> ✅ 추가
+- 로컬 STT: Whisper 계열(권장: faster-whisper) -> ✅ 사용
+- 로컬 LLM: **Ollama + deepseek-r1** (로컬 설치 가정) -> ✅ 사용
+- API Key 필요 없음 -> ✅
+
+사전 준비
+1) (권장) GPU가 있다면 `faster-whisper`가 매우 빠릅니다.
+   pip install -U faster-whisper gradio requests soundfile numpy
+
+   ※ pure Python whisper를 쓰고 싶다면:
+   pip install -U openai-whisper gradio requests soundfile numpy
+   로 바꾸고, 아래 ASR_BACKEND="faster-whisper"를 "whisper"로 바꾸세요.
+
+2) Ollama 설치 및 모델 준비 (로컬 PC에 설치되어 있다고 가정)
+   - https://ollama.com/download 에서 설치
+   - 모델 다운로드(예시, 7B/32B 중 택1):
+     ollama pull deepseek-r1:7b
+     # 또는
+     ollama pull deepseek-r1:32b
+
+3) 실행:
+   python app_transcribe_ollama_gradio.py
+   브라우저가 열리면 오디오 업로드 후 전사/번역/후처리를 실행하세요.
+"""
+
+from __future__ import annotations
+import os
+import re
+import time
+import tempfile
+import requests
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, Tuple
+
+import gradio as gr
+import numpy as np
+
+# ===============================
+# 설정 섹션
+# ===============================
+
+# ASR 백엔드 선택: "faster-whisper" (권장) 또는 "whisper"
+ASR_BACKEND = "faster-whisper"  # "whisper" 로 바꿔도 동작 (속도는 느릴 수 있음)
+
+# faster-whisper 모델 크기 예시:
+#  - tiny, base, small, medium, large-v3 (CPU/GPU 여건에 맞게 선택)
+DEFAULT_ASR_MODEL = "base"
+
+# Ollama 설정 (기본 포트 11434)
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "deepseek-r1:7b")  # 환경에 맞게 변경 가능
+
+# DeepSeek-R1의 <think>...</think> 추론 텍스트를 숨기고 결과만 보여줄지 여부
+HIDE_REASONING_BY_DEFAULT = True
+
+# ===============================
+# 유틸
+# ===============================
+
+def human_time(s: float) -> str:
+    """초 -> 사람이 읽기 쉬운 문자열"""
+    if s < 1.0:
+        return f"{s*1000:.0f} ms"
+    m, ss = divmod(int(s), 60)
+    if m == 0:
+        return f"{s:.2f} s"
+    h, mm = divmod(m, 60)
+    if h == 0:
+        return f"{mm}m {ss}s"
+    return f"{h}h {mm}m {ss}s"
+
+
+def strip_deepseek_think(text: str, keep_reasoning: bool = False) -> Tuple[str, Optional[str]]:
+    """
+    DeepSeek-R1은 <think> ... </think> 형태의 '사고(Reasoning)'를 함께 반환합니다.
+    - keep_reasoning=True  : 둘 다 반환
+    - keep_reasoning=False : 사고를 제거하고 '최종 답변'만 반환
+    """
+    think_blocks = re.findall(r"<think>(.*?)</think>", text, flags=re.DOTALL)
+    clean = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    reasoning = "\n\n---\n".join(tb.strip() for tb in think_blocks) if think_blocks else None
+    if keep_reasoning:
+        return clean, reasoning
+    return clean, None
+
+
+def lang_label_to_code(label: str) -> Optional[str]:
+    """UI 라벨을 Whisper 언어코드로 매핑 (None은 자동 감지)"""
+    mapping = {
+        "자동 감지 (Auto)": None,
+        "영어 (en)": "en",
+        "한국어 (ko)": "ko",
+        "중국어 (zh)": "zh",
+        "일본어 (ja)": "ja",
+        "스페인어 (es)": "es",
+        "프랑스어 (fr)": "fr",
+        "독일어 (de)": "de",
+        "이탈리아어 (it)": "it",
+        "포르투갈어 (pt)": "pt",
+        "러시아어 (ru)": "ru",
+        "베트남어 (vi)": "vi",
+        "태국어 (th)": "th",
+    }
+    return mapping.get(label, None)
+
+
+# ===============================
+# ASR (Whisper) 래퍼
+# ===============================
+
+@dataclass
+class ASRResult:
+    text: str
+    lang: Optional[str]
+    segments: Optional[list]
+    info: Dict[str, Any]
+
+
+class ASRWhisper:
+    """
+    로컬 Whisper STT:
+    - faster-whisper (권장): GPU 가속, 빠르고 메모리 효율적
+    - openai-whisper (파이썬판): 설치 간단, 속도는 느릴 수 있음
+    """
+
+    def __init__(self, model_size: str = DEFAULT_ASR_MODEL, backend: str = ASR_BACKEND):
+        self.backend = backend
+        self.model_size = model_size
+        self._model = None
+
+    def load(self):
+        if self._model is not None:
+            return
+        if self.backend == "faster-whisper":
+            from faster_whisper import WhisperModel  # lazy import
+            # device="auto" 가 GPU 있으면 cuda 사용, 없으면 CPU
+            self._model = WhisperModel(self.model_size, device="auto", compute_type="auto")
+        elif self.backend == "whisper":
+            import whisper  # lazy import
+            self._model = whisper.load_model(self.model_size)
+        else:
+            raise ValueError("지원하지 않는 ASR 백엔드입니다.")
+
+    def transcribe(
+        self,
+        audio_path: str,
+        language: Optional[str] = None,
+        task: str = "transcribe",  # 'transcribe' 원문전사, 'translate' 영어로 번역
+        initial_prompt: Optional[str] = None,
+    ) -> ASRResult:
+        """
+        audio_path: 오디오 파일 경로
+        language: 언어 코드 (None이면 자동 감지)
+        task: "transcribe" 또는 "translate"
+        initial_prompt: 단어 철자 힌트(예: 'Cypher') 등
+        """
+        self.load()
+        t0 = time.time()
+
+        if self.backend == "faster-whisper":
+            # Faster-Whisper는 generate 옵션을 dict로 받음
+            segments, info = self._model.transcribe(
+                audio_path,
+                language=language,
+                task=task,
+                initial_prompt=initial_prompt,
+                beam_size=5,
+                vad_filter=True,
+            )
+            text_parts = []
+            seg_list = []
+            for s in segments:
+                text_parts.append(s.text)
+                seg_list.append({
+                    "start": s.start,
+                    "end": s.end,
+                    "text": s.text,
+                    "avg_logprob": s.avg_logprob,
+                    "no_speech_prob": s.no_speech_prob,
+                    "compression_ratio": s.compression_ratio,
+                })
+            full_text = "".join(text_parts).strip()
+            elapsed = time.time() - t0
+            return ASRResult(
+                text=full_text,
+                lang=info.language,
+                segments=seg_list,
+                info={
+                    "duration_s": info.duration,
+                    "time": elapsed,
+                    "backend": self.backend,
+                    "model_size": self.model_size,
+                },
+            )
+
+        # openai-whisper (파이썬)
+        import whisper
+        # task='translate'인 경우, 영어로 번역됨
+        result = self._model.transcribe(
+            audio_path,
+            language=language,
+            task=task,
+            initial_prompt=initial_prompt,
+            verbose=False
+        )
+        elapsed = time.time() - t0
+        return ASRResult(
+            text=result.get("text", "").strip(),
+            lang=result.get("language"),
+            segments=result.get("segments"),
+            info={
+                "duration_s": result.get("duration"),
+                "time": elapsed,
+                "backend": self.backend,
+                "model_size": self.model_size,
+            },
+        )
+
+
+# ===============================
+# Ollama (DeepSeek-R1) 래퍼
+# ===============================
+
+class OllamaClient:
+    """
+    Ollama 로컬 서버와 대화.
+    - 기본 엔드포인트: POST /api/chat
+    - 모델: deepseek-r1:7b (기본값, 환경에 따라 조정)
+    """
+
+    def __init__(self, host: str = OLLAMA_HOST, model: str = OLLAMA_MODEL, timeout: int = 120):
+        self.host = host.rstrip("/")
+        self.model = model
+        self.timeout = timeout
+
+    def chat(self, system_prompt: str, user_prompt: str, temperature: float = 0.2) -> str:
+        url = f"{self.host}/api/chat"
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "options": {
+                "temperature": temperature
+            },
+            "stream": False,  # 간단히 일괄 응답
+        }
+        resp = requests.post(url, json=payload, timeout=self.timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        # Ollama /api/chat 포맷: {'message': {'content': '...'}}
+        return data.get("message", {}).get("content", "")
+
+
+# ===============================
+# 전사 + 후처리 파이프라인
+# ===============================
+
+ASR = ASRWhisper(model_size=DEFAULT_ASR_MODEL, backend=ASR_BACKEND)
+OLLAMA = OllamaClient()
+
+DEFAULT_SYSTEM_PROMPT = """당신은 전문 오디오 전사 교정가입니다.
+규칙:
+1) 주어진 전사 텍스트의 오타/오인식을 문맥에 맞게 교정하세요.
+2) 인명/지명/전문용어는 일반적으로 통용되는 표기법으로 통일하세요.
+3) 불필요한 추론 설명은 출력하지 말고, **교정된 본문만** 내보내세요.
+4) 타임스탬프나 괄호 같은 메타 정보가 있으면 유지하되, 문장부호와 띄어쓰기는 자연스럽게 정리하세요.
+"""
+
+EXAMPLE_HINT = "예: 'Cypher' 단어를 우선시해서 인식해줘"
+
+def run_pipeline(
+    audio_file: Optional[str],
+    asr_model_size: str,
+    mode: str,  # "transcribe" or "translate"
+    ui_lang_label: str,
+    hint: str,
+    do_postprocess: bool,
+    sys_prompt: str,
+    temperature: float,
+    show_reasoning: bool,
+) -> Tuple[str, str, str, Dict[str, Any]]:
+    """
+    Gradio 이벤트 핸들러:
+    - audio_file: 업로드 파일 경로
+    - asr_model_size: tiny/base/small/medium/large-v3...
+    - mode: 'transcribe' (원문 전사), 'translate' (영어 번역)
+    - ui_lang_label: 언어 선택 라벨
+    - hint: 초기 힌트(용어/철자)
+    - do_postprocess: LLM 후처리 여부
+    - sys_prompt: 시스템 프롬프트(후처리 규칙)
+    - temperature: LLM 샘플링 온도
+    - show_reasoning: DeepSeek 사고(think) 노출 여부
+    """
+    if not audio_file:
+        return "", "", "오디오 파일이 없습니다.", {}
+
+    # 임시 파일 생성 (그대로 경로 전달해도 되지만, 확실하게 처리)
+    tmp = audio_file
+
+    # ASR 모델 적용
+    ASR.model_size = asr_model_size
+    ASR._model = None  # 모델 크기 바뀌면 다시 로드
+    lang_code = lang_label_to_code(ui_lang_label)
+    task = "translate" if mode == "translate" else "transcribe"
+
+    asr_res = ASR.transcribe(
+        tmp,
+        language=lang_code,
+        task=task,
+        initial_prompt=hint or None
+    )
+
+    raw_txt = asr_res.text or ""
+    meta = {
+        "asr_backend": asr_res.info.get("backend"),
+        "asr_model": asr_res.info.get("model_size"),
+        "detected_language": asr_res.lang,
+        "audio_duration_s": asr_res.info.get("duration_s"),
+        "asr_time": human_time(asr_res.info.get("time", 0.0)),
+        "mode": mode,
+    }
+
+    if not do_postprocess or len(raw_txt.strip()) == 0:
+        return raw_txt, "", "LLM 후처리 미실행 (또는 전사 결과 없음)", meta
+
+    # LLM 후처리 (Ollama + deepseek-r1)
+    try:
+        user_prompt = raw_txt
+        llm_out = OLLAMA.chat(system_prompt=sys_prompt.strip() or DEFAULT_SYSTEM_PROMPT,
+                              user_prompt=user_prompt,
+                              temperature=float(temperature))
+        cleaned, reasoning = strip_deepseek_think(llm_out, keep_reasoning=show_reasoning)
+        return raw_txt, cleaned, (reasoning or "사고(think) 숨김"), meta
+    except Exception as e:
+        return raw_txt, "", f"Ollama 후처리 오류: {e}", meta
+
+
+# ===============================
+# Gradio UI
+# ===============================
+
+ASR_MODEL_CHOICES = ["tiny", "base", "small", "medium", "large-v3"]
+LANG_CHOICES = [
+    "자동 감지 (Auto)",
+    "영어 (en)", "한국어 (ko)", "중국어 (zh)", "일본어 (ja)",
+    "스페인어 (es)", "프랑스어 (fr)", "독일어 (de)",
+    "이탈리아어 (it)", "포르투갈어 (pt)", "러시아어 (ru)",
+    "베트남어 (vi)", "태국어 (th)",
+]
+
+with gr.Blocks(title="Whisper + DeepSeek-R1 (Ollama) 로컬 전사/번역", theme=gr.themes.Soft()) as demo:
+    gr.Markdown(
+        """
+        # 🎙️ Whisper + 🧠 DeepSeek-R1 (Ollama) — 로컬 전사·번역·교정
+        - **ASR**: faster-whisper / whisper (로컬)
+        - **LLM 후처리**: deepseek-r1 (Ollama, 로컬)
+        - API Key 불필요, 인터넷 연결 불필요(모델만 로컬 설치되어 있으면 됨)
+        """
+    )
+
+    with gr.Row():
+        audio = gr.Audio(label="오디오 파일 업로드", sources=["upload"], type="filepath")
+
+    with gr.Row():
+        asr_model = gr.Dropdown(ASR_MODEL_CHOICES, value=DEFAULT_ASR_MODEL, label="ASR 모델 크기")
+        lang = gr.Dropdown(LANG_CHOICES, value="자동 감지 (Auto)", label="언어")
+        mode = gr.Radio(choices=["transcribe (원문 전사)", "translate (영어 번역)"],
+                        value="transcribe (원문 전사)", label="작업 모드")
+    hint = gr.Textbox(value=EXAMPLE_HINT, label="전사 힌트(선택, 용어/철자 등)", placeholder="예: Cypher, Kubernetes, Winston Churchill ...")
+
+    with gr.Accordion("LLM(DeepSeek-R1) 후처리 설정", open=False):
+        enable_post = gr.Checkbox(value=True, label="후처리 사용 (권장)")
+        sys_prompt = gr.Textbox(value=DEFAULT_SYSTEM_PROMPT, lines=6, label="시스템 프롬프트")
+        temperature = gr.Slider(0.0, 1.2, value=0.2, step=0.1, label="샘플링 온도")
+        show_reasoning = gr.Checkbox(value=(not HIDE_REASONING_BY_DEFAULT), label="DeepSeek 사고(think) 출력 표시")
+
+    run_btn = gr.Button("실행", variant="primary")
+
+    with gr.Row():
+        raw_out = gr.Textbox(lines=10, label="전사 결과 (RAW)")
+        post_out = gr.Textbox(lines=10, label="후처리 결과 (CLEANED)")
+    reason_out = gr.Textbox(lines=8, label="(선택) 모델 사고(think) 또는 메시지", value="사고(think) 숨김")
+
+    meta_json = gr.JSON(label="메타 정보")
+
+    def _run(audio_path, asr_size, mode_label, lang_label, hint_text,
+             do_post, sys_p, temp, show_think):
+        mode_key = "translate" if "translate" in mode_label else "transcribe"
+        return run_pipeline(audio_path, asr_size, mode_key, lang_label, hint_text, do_post, sys_p, temp, show_think)
+
+    run_btn.click(
+        _run,
+        inputs=[audio, asr_model, mode, lang, hint, enable_post, sys_prompt, temperature, show_reasoning],
+        outputs=[raw_out, post_out, reason_out, meta_json]
+    )
+
+    gr.Markdown(
+        """
+        ### 사용 팁
+        - **번역 모드**: Whisper의 `translate`은 결과를 영어로 통일합니다.
+        - **힌트 사용**: 고유명사·브랜드·전문용어를 `전사 힌트`에 적으면 오인식이 줄어듭니다.
+        - **모델 크기**: `tiny/base`는 빠르지만 정확도 낮음, `medium/large-v3`는 느리지만 정확도 높음.
+        - **DeepSeek 사고**: 체크 해제 시 `<think>...</think>`는 제거되고 결과만 보여줍니다.
+        """
+    )
+
+# ===============================
+# CLI 실행도 지원 (옵션)
+# ===============================
+
+def cli_demo_example():
+    """
+    간단 CLI 예시:
+    python app_transcribe_ollama_gradio.py --cli path/to/audio.wav --lang "영어 (en)" --mode transcribe
+    """
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cli", type=str, help="오디오 파일 경로(지정 시 CLI 모드로 1회 실행)")
+    parser.add_argument("--lang", type=str, default="자동 감지 (Auto)")
+    parser.add_argument("--mode", type=str, choices=["transcribe", "translate"], default="transcribe")
+    parser.add_argument("--model", type=str, default=DEFAULT_ASR_MODEL)
+    parser.add_argument("--hint", type=str, default="")
+    parser.add_argument("--no-post", action="store_true", help="LLM 후처리 비활성화")
+    parser.add_argument("--temp", type=float, default=0.2)
+    parser.add_argument("--show-think", action="store_true")
+    args = parser.parse_args()
+
+    if not args.cli:
+        return False
+
+    raw, cleaned, msg, meta = run_pipeline(
+        audio_file=args.cli,
+        asr_model_size=args.model,
+        mode=args.mode,
+        ui_lang_label=args.lang,
+        hint=args.hint,
+        do_postprocess=(not args.no_post),
+        sys_prompt=DEFAULT_SYSTEM_PROMPT,
+        temperature=args.temp,
+        show_reasoning=args.show_think,
+    )
+    print("=== RAW ===")
+    print(raw)
+    print("\n=== CLEANED ===")
+    print(cleaned)
+    print("\n=== MSG/THINK ===")
+    print(msg)
+    print("\n=== META ===")
+    print(meta)
+    return True
+
+
+if __name__ == "__main__":
+    # CLI 단발 실행 모드
+    if not cli_demo_example():
+        # GUI 실행
+        demo.launch()

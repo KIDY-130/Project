@@ -1,0 +1,298 @@
+#95
+# OpenSource_Image_Gen_and_Analysis.py
+# -----------------------------------------------------------------------------
+# ✅ 목적
+#   - OpenAI 전용 이미지 생성/분석 코드를 **로컬 오픈소스 스택**으로 변환
+#   - API Key 없이 동작 (로컬 **Ollama** + **Diffusers/Stable Diffusion**)
+#   - 간편한 **Gradio GUI** 제공 (텍스트→이미지 / 단일 이미지 설명 / 다중 이미지 설명)
+#
+# ✅ 구성
+#   1) 텍스트→이미지: Hugging Face Diffusers의 SDXL Turbo(기본) 또는 Stable Diffusion 사용
+#   2) 이미지→텍스트(설명): Ollama 비전 모델(예: "llama3.2-vision" 또는 "llava:13b")
+#   3) 여러 이미지 동시 분석: 비전 모델에 다중 이미지 입력
+#
+# ✅ 준비물
+#   - Ollama 실행: `ollama serve`
+#   - (최초 1회) 모델 다운로드:
+#       * 비전 LLM: `ollama pull llama3.2-vision`  (또는 `ollava:13b`)
+#       * 텍스트2이미지(로컬): 파이썬에서 자동 다운로드 (sdxl-turbo 권장)
+#         - GPU 권장, CPU도 가능(느릴 수 있음)
+#
+# ✅ 실행
+#   - `python OpenSource_Image_Gen_and_Analysis.py`
+#   - 브라우저에서 http://localhost:7860 접속
+# -----------------------------------------------------------------------------
+
+import os
+import io
+import re
+import base64
+import requests
+from typing import List, Tuple, Optional
+
+import gradio as gr
+from PIL import Image
+
+# Diffusers (Stable Diffusion / SDXL)
+import torch
+from diffusers import AutoPipelineForText2Image
+
+# -----------------------------
+# 환경 변수/상수
+# -----------------------------
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+VISION_MODEL = os.environ.get("VISION_MODEL", "llama3.2-vision")  # 대안: "llava:13b"
+TI_MODEL_REPO = os.environ.get("TI_MODEL_REPO", "stabilityai/sdxl-turbo")  # 텍스트→이미지 기본
+
+# -----------------------------
+# 공용 유틸
+# -----------------------------
+
+def fetch_image_from_url(url: str) -> Image.Image:
+    """URL에서 이미지를 다운로드하여 PIL Image로 반환."""
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    return Image.open(io.BytesIO(resp.content)).convert("RGB")
+
+
+def pil_to_base64(img: Image.Image, fmt: str = "PNG") -> str:
+    """PIL 이미지를 base64 문자열로 변환 (Ollama vision에 전달용)."""
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+# -----------------------------
+# Ollama Vision 호출 래퍼 (이미지 설명)
+# -----------------------------
+
+def ollama_vision_describe(prompt: str, images: List[Image.Image], model: str = VISION_MODEL,
+                            temperature: float = 0.2, max_tokens: int = 512) -> str:
+    """Ollama 비전 모델에 이미지 배열과 프롬프트를 전달해 설명 생성."""
+    url = f"{OLLAMA_HOST}/api/generate"
+    b64_list = [pil_to_base64(im) for im in images]
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "images": b64_list,       # Ollama는 base64 이미지 배열을 지원
+        "stream": False,
+        "options": {
+            "temperature": float(temperature),
+            "num_predict": int(max_tokens),
+        },
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=180)
+        r.raise_for_status()
+        return r.json().get("response", "").strip()
+    except Exception as e:
+        return f"[오류] Ollama vision 호출 실패: {e}"
+
+
+# -----------------------------
+# Diffusers: 텍스트 → 이미지 파이프라인 초기화 (지연 로딩)
+# -----------------------------
+_t2i_pipe: Optional[AutoPipelineForText2Image] = None
+
+def get_t2i_pipeline(model_repo: str = TI_MODEL_REPO) -> AutoPipelineForText2Image:
+    global _t2i_pipe
+    if _t2i_pipe is not None:
+        return _t2i_pipe
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    pipe = AutoPipelineForText2Image.from_pretrained(
+        model_repo,
+        torch_dtype=dtype,
+        variant="fp16" if torch.cuda.is_available() else None,
+    )
+    pipe = pipe.to(device)
+
+    # SDXL Turbo는 guidance_scale 0.0~1.5, steps 1~4 권장
+    # 일반 SDXL/SD1.5는 20~30 steps + guidance 7~9 권장
+    _t2i_pipe = pipe
+    return _t2i_pipe
+
+
+def txt2img(prompt: str, width: int = 768, height: int = 768,
+            steps: int = 4, guidance: float = 0.0,
+            model_repo: str = TI_MODEL_REPO, seed: Optional[int] = None,
+            num_images: int = 1) -> List[Image.Image]:
+    """Diffusers 로컬 파이프라인으로 텍스트에서 이미지 생성."""
+    if not prompt.strip():
+        raise ValueError("프롬프트를 입력하세요.")
+
+    pipe = get_t2i_pipeline(model_repo)
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=pipe.device).manual_seed(int(seed))
+
+    images = []
+    for _ in range(int(num_images)):
+        out = pipe(
+            prompt=prompt,
+            width=int(width), height=int(height),
+            num_inference_steps=int(steps), guidance_scale=float(guidance),
+            generator=generator,
+        )
+        images.append(out.images[0])
+    return images
+
+
+# -----------------------------
+# Gradio 핸들러들
+# -----------------------------
+
+# 1) 텍스트 → 이미지
+
+def ui_txt2img(prompt: str, size: str, steps: int, guidance: float,
+               model_repo: str, seed: str, n: int):
+    try:
+        w, h = map(int, size.lower().split("x"))
+        seed_val = int(seed) if seed and seed.strip() else None
+        imgs = txt2img(prompt, width=w, height=h, steps=steps, guidance=guidance,
+                       model_repo=model_repo, seed=seed_val, num_images=n)
+        return imgs, f"생성 완료: {len(imgs)}장"
+    except Exception as e:
+        return None, f"[오류] 텍스트→이미지 실패: {e}"
+
+
+# 2) 단일 이미지 설명 (업로드 또는 URL)
+
+def ui_describe_single(image: Image.Image, url: str, prompt: str, model: str, temperature: float, max_tokens: int):
+    try:
+        imgs = []
+        if image is not None:
+            imgs.append(image)
+        if url and url.strip():
+            imgs.append(fetch_image_from_url(url.strip()))
+        if not imgs:
+            return "[경고] 이미지 파일을 업로드하거나 URL을 입력하세요."
+        p = prompt.strip() or "이 이미지의 핵심 요소를 간결히 설명해 주세요."
+        ans = ollama_vision_describe(p, imgs, model=model, temperature=temperature, max_tokens=max_tokens)
+        return ans
+    except Exception as e:
+        return f"[오류] 단일 이미지 설명 실패: {e}"
+
+
+# 3) 다중 이미지 설명 (업로드 여러 장 또는 URL 여러 줄)
+
+def ui_describe_multi(images: list, urls_text: str, prompt: str, model: str, temperature: float, max_tokens: int):
+    try:
+        imgs: List[Image.Image] = []
+        if images:
+            for im in images:
+                if im is not None:
+                    imgs.append(im)
+        if urls_text and urls_text.strip():
+            for line in urls_text.splitlines():
+                u = line.strip()
+                if not u:
+                    continue
+                imgs.append(fetch_image_from_url(u))
+        if not imgs:
+            return "[경고] 이미지(들)를 업로드하거나 URL 목록을 입력하세요."
+        p = prompt.strip() or "다음 이미지들의 공통점/차이점/주요 특징을 초보자에게 설명해 주세요."
+        ans = ollama_vision_describe(p, imgs, model=model, temperature=temperature, max_tokens=max_tokens)
+        return ans
+    except Exception as e:
+        return f"[오류] 다중 이미지 설명 실패: {e}"
+
+
+# -----------------------------
+# Gradio UI 구성
+# -----------------------------
+with gr.Blocks(title="OpenCode · 로컬 이미지 생성/분석", theme=gr.themes.Soft()) as demo:
+    gr.Markdown(
+        """
+        # 🧩 OpenCode · 로컬 이미지 생성/분석 (Ollama + Diffusers)
+        - OpenAI API 없이 **로컬**에서 이미지 생성/분석을 수행합니다.
+        - 텍스트→이미지: Diffusers (기본: SDXL Turbo)
+        - 이미지 설명: Ollama 비전 모델 (기본: `llama3.2-vision`)
+        """
+    )
+
+    # TAB 1: 텍스트 → 이미지
+    with gr.Tab("1) 텍스트 → 이미지"):
+        gr.Markdown("SDXL Turbo를 기본으로 빠르게 생성 (권장: steps 1~4, guidance 0.0~1.5)")
+        with gr.Row():
+            prompt = gr.Textbox(label="프롬프트", value="A beautiful futuristic city at sunset with neon lights and flying cars")
+        with gr.Row():
+            size = gr.Dropdown(choices=["512x512", "768x768", "1024x1024"], value="768x768", label="이미지 크기")
+            steps = gr.Slider(1, 50, value=4, step=1, label="Steps")
+            guidance = gr.Slider(0.0, 12.0, value=0.0, step=0.1, label="Guidance Scale")
+        with gr.Row():
+            model_repo = gr.Textbox(label="Diffusers 모델 레포 (변경 가능)", value=TI_MODEL_REPO)
+            seed = gr.Textbox(label="Seed (옵션)")
+            nimg = gr.Slider(1, 4, value=1, step=1, label="생성 개수")
+        run_btn = gr.Button("이미지 생성")
+        gallery = gr.Gallery(label="결과 미리보기").style(grid=(2,))
+        status1 = gr.Textbox(label="상태 메시지", interactive=False)
+        run_btn.click(ui_txt2img, inputs=[prompt, size, steps, guidance, model_repo, seed, nimg], outputs=[gallery, status1])
+
+    # TAB 2: 단일 이미지 설명
+    with gr.Tab("2) 단일 이미지 설명"):
+        gr.Markdown("업로드 또는 URL로 1~2장의 이미지를 입력해 설명을 생성")
+        with gr.Row():
+            up = gr.Image(type="pil", label="이미지 업로드 (선택)")
+            url = gr.Textbox(label="이미지 URL (선택)", value="https://ldjwj.github.io/SOURCE_VideoSoraGen3Etc/img/cat_computer.png")
+        with gr.Row():
+            vprompt = gr.Textbox(label="설명 프롬프트", value="이 이미지에 무엇이 있는지 자세히 설명해 주세요.")
+        with gr.Row():
+            vmodel = gr.Textbox(label="Ollama 비전 모델", value=VISION_MODEL)
+            vtemp = gr.Slider(0.0, 1.0, value=0.2, step=0.05, label="Temperature")
+            vmax = gr.Slider(64, 1024, value=512, step=16, label="Max Tokens")
+        run2 = gr.Button("설명 생성")
+        out2 = gr.Textbox(label="설명 결과", lines=10)
+        run2.click(ui_describe_single, inputs=[up, url, vprompt, vmodel, vtemp, vmax], outputs=[out2])
+
+    # TAB 3: 다중 이미지 설명
+    with gr.Tab("3) 다중 이미지 설명"):
+        gr.Markdown("여러 장을 업로드하거나, URL을 줄바꿈으로 여러 개 입력할 수 있습니다.")
+        imgs = gr.File(file_count="multiple", type="filepath", label="여러 이미지 업로드(선택)")  # 내부 변환용 대체
+        # Gradio의 다중 Image 컴포넌트가 생성물 저장 이슈가 있어, 아래와 같이 업로드 후 PIL로 재로드
+        up_multi = gr.Image(type="pil", sources=["upload"], label="(옵션) 추가 업로드: 마지막 1장", visible=False)
+        urls_text = gr.Textbox(label="이미지 URL 목록(줄바꿈 구분)", lines=5,
+                               value="\n".join([
+                                   "https://ldjwj.github.io/SOURCE_VideoSoraGen3Etc/img/bird_Gen4.png",
+                                   "https://ldjwj.github.io/SOURCE_VideoSoraGen3Etc/img/cat_computer.png",
+                                   "https://ldjwj.github.io/SOURCE_VideoSoraGen3Etc/img/edu_webtoon.png",
+                                   "https://ldjwj.github.io/SOURCE_VideoSoraGen3Etc/img/truth_01.png",
+                               ]))
+        mprompt = gr.Textbox(label="설명 프롬프트", value="이 네 이미지를 초보자에게 분석해서 설명해 주세요")
+        with gr.Row():
+            mmodel = gr.Textbox(label="Ollama 비전 모델", value=VISION_MODEL)
+            mtemp = gr.Slider(0.0, 1.0, value=0.2, step=0.05, label="Temperature")
+            mmax = gr.Slider(64, 2048, value=800, step=16, label="Max Tokens")
+        run3 = gr.Button("다중 설명 생성")
+        out3 = gr.Textbox(label="설명 결과", lines=14)
+
+        def _load_many_and_call(files, prompt, urls, model, temperature, max_tokens):
+            # files: 파일 경로 목록 → PIL Image 로드
+            pil_list = []
+            try:
+                if files:
+                    for p in files:
+                        try:
+                            with open(p, "rb") as f:
+                                pil_list.append(Image.open(f).convert("RGB"))
+                        except Exception:
+                            pass
+                if urls and urls.strip():
+                    for line in urls.splitlines():
+                        u = line.strip()
+                        if not u:
+                            continue
+                        pil_list.append(fetch_image_from_url(u))
+                if not pil_list:
+                    return "[경고] 이미지(들) 또는 URL 목록을 입력하세요."
+                return ollama_vision_describe(prompt or "이미지들을 설명해 주세요.", pil_list, model=model,
+                                              temperature=temperature, max_tokens=max_tokens)
+            except Exception as e:
+                return f"[오류] 처리 실패: {e}"
+
+        run3.click(_load_many_and_call, inputs=[imgs, mprompt, urls_text, mmodel, mtemp, mmax], outputs=[out3])
+
+if __name__ == "__main__":
+    # 공유/외부 접속 필요시 server_name="0.0.0.0" 로 변경
+    demo.launch(server_name="127.0.0.1", server_port=7860)

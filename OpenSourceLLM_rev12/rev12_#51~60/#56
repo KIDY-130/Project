@@ -1,0 +1,195 @@
+#56
+# ai_poet_ollama.py
+# ------------------------------------------------------------
+# OpenCode: Ollama(DeepSeek-R1) + Gradio로 동작하는 "인공지능 시인"
+# - 로컬 LLM 사용: 외부 API Key 불필요
+# - Streamlit / ChatOpenAI / LangChain 의존 제거
+# - 시 생성 옵션 제공(스타일, 톤, 형식, 길이, 운율, 언어, temperature)
+# - DeepSeek-R1의 <think> 블록 자동 제거
+# ------------------------------------------------------------
+
+import re
+import json
+import requests
+import gradio as gr
+from typing import Optional
+
+# =========================
+# Ollama 설정
+# =========================
+OLLAMA_HOST = "http://localhost:11434"
+MODEL_NAME = "deepseek-r1"   # 미설치 시: `ollama pull deepseek-r1`
+
+# =========================
+# 유틸: DeepSeek <think> 제거
+# =========================
+def strip_think(text: str) -> str:
+    """
+    DeepSeek 계열 모델이 출력하는 <think>...</think> 내부 사고 내용을 제거해
+    사용자에게는 최종 시만 보여줍니다.
+    """
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+# =========================
+# Ollama 호출 함수
+# =========================
+def ollama_generate(prompt: str, model: str = MODEL_NAME, temperature: float = 0.7, host: str = OLLAMA_HOST) -> str:
+    """
+    Ollama /api/generate 호출(비스트리밍). 네트워크/서버 오류 시 예외 발생.
+    """
+    resp = requests.post(
+        f"{host}/api/generate",
+        json={"model": model, "prompt": prompt, "temperature": temperature, "stream": False},
+        timeout=60,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Ollama 호출 실패(status={resp.status_code}): {resp.text[:300]}")
+    data = resp.json()
+    return data.get("response", "")
+
+# =========================
+# 프롬프트 빌더
+# =========================
+def build_poem_prompt(
+    topic: str,
+    style: str,
+    tone: str,
+    form: str,
+    target_lang: str,
+    lines: int,
+    rhyme: bool
+) -> str:
+    """
+    모델에게 시를 작성하도록 지시하는 프롬프트를 구성합니다.
+    - target_lang: 최종 출력 언어(예: Korean, English, Japanese ...)
+    - form: Free Verse / Haiku / Sonnet(14행) / Acrostic 등
+    - lines: 권장 행 수
+    - rhyme: 운율(운문) 여부
+    """
+    constraints = []
+    if form == "Haiku":
+        constraints.append("형식: 하이쿠(5-7-5 음절 권장, 엄격히 강제하진 않음)")
+    elif form == "Sonnet":
+        constraints.append("형식: 소네트(약 14행, 가능하면 셰익스피어식 운율)")
+    elif form == "Acrostic":
+        constraints.append("형식: 두운시(각 행 첫 글자가 주제를 이루도록 시도)")
+    else:
+        constraints.append("형식: 자유시")
+
+    constraints.append(f"권장 행 수: 약 {lines}행")
+    constraints.append("운율: 사용" if rhyme else "운율: 사용하지 않음")
+    constraints.append(f"어조(톤): {tone}")
+    constraints.append(f"스타일: {style}")
+    constraints.append("금지: 설명 문장, 메타 발화, 프롬프트 반복, 머리말/꼬리말")
+
+    sys_note = (
+        "You are a skilled poet AI.\n"
+        f"Write the poem in {target_lang}. Keep it polished and evocative."
+    )
+
+    prompt = (
+        f"{sys_note}\n\n"
+        f"[주제]\n{topic}\n\n"
+        "[요구 사항]\n- " + "\n- ".join(constraints) + "\n\n"
+        "[출력]\n시 본문만 출력하세요."
+    )
+    return prompt
+
+# =========================
+# 시 생성 핸들러 (Gradio 콜백)
+# =========================
+def generate_poem(
+    topic: str,
+    style: str,
+    tone: str,
+    form: str,
+    lines: int,
+    rhyme: bool,
+    target_lang: str,
+    temperature: float,
+    model_name: str
+):
+    topic = (topic or "").strip()
+    if not topic:
+        return "⚠️ 시의 주제를 입력하세요."
+
+    model = (model_name or MODEL_NAME).strip()
+    prompt = build_poem_prompt(
+        topic=topic,
+        style=style,
+        tone=tone,
+        form=form,
+        target_lang=target_lang,
+        lines=int(lines),
+        rhyme=bool(rhyme),
+    )
+
+    try:
+        raw = ollama_generate(prompt, model=model, temperature=temperature)
+        poem = strip_think(raw)
+        return poem
+    except Exception as e:
+        return f"[오류] 모델 호출 실패: {e}"
+
+# =========================
+# Gradio UI
+# =========================
+EX_TOPIC = "가을 저녁 강가에 비치는 도시의 불빛"
+
+with gr.Blocks(title="OpenCode - 인공지능 시인 (Ollama + DeepSeek-R1)") as demo:
+    gr.Markdown("## ✒️ 인공지능 시인\n로컬 **Ollama + DeepSeek-R1**로 창작합니다. API Key가 필요 없습니다.")
+
+    with gr.Row():
+        topic_tb = gr.Textbox(label="시의 주제", value=EX_TOPIC, lines=2, placeholder="예: 비 오는 서울의 새벽 골목")
+
+    with gr.Row():
+        style_dd = gr.Dropdown(
+            label="스타일",
+            choices=["모던", "클래식", "서정", "서사", "초현실", "극사실"],
+            value="서정",
+        )
+        tone_dd = gr.Dropdown(
+            label="톤(어조)",
+            choices=["잔잔한", "쓸쓸한", "희망찬", "어두운", "고양적인", "장난기 있는"],
+            value="잔잔한",
+        )
+        form_dd = gr.Dropdown(
+            label="형식",
+            choices=["Free Verse", "Haiku", "Sonnet", "Acrostic"],
+            value="Free Verse",
+        )
+
+    with gr.Row():
+        lines_sl = gr.Slider(3, 30, value=10, step=1, label="권장 행 수")
+        rhyme_cb = gr.Checkbox(value=False, label="운율(운문) 사용")
+
+    with gr.Row():
+        lang_dd = gr.Dropdown(
+            label="출력 언어",
+            choices=["Korean", "English", "Japanese", "Chinese", "Spanish", "French", "German"],
+            value="Korean",
+        )
+        temp_sl = gr.Slider(0.0, 1.5, value=0.8, step=0.1, label="창의성 (temperature)")
+        model_tb = gr.Textbox(label="모델 이름", value=MODEL_NAME, placeholder="예: deepseek-r1, qwen2.5:14b, llama3.1:8b ...")
+
+    gen_btn = gr.Button("시 작성 요청하기 ✨")
+    output_poem = gr.Textbox(label="생성된 시", lines=18)
+
+    gen_btn.click(
+        fn=generate_poem,
+        inputs=[topic_tb, style_dd, tone_dd, form_dd, lines_sl, rhyme_cb, lang_dd, temp_sl, model_tb],
+        outputs=[output_poem]
+    )
+
+if __name__ == "__main__":
+    # 최초 1회 모델 설치:
+    #   $ ollama pull deepseek-r1
+    demo.launch()
+
+
+
+
+
+
+
+

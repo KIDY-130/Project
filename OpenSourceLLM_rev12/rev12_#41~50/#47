@@ -1,0 +1,440 @@
+#47
+# =========================================================
+# OpenCode: ChatGPT 코드 → 오픈소스 LLM(Ollama/DeepSeek-R1) + Gradio GUI 변환 예제
+# ---------------------------------------------------------
+# 목적
+#  - 폐쇄형(OpenAI) API 코드를 로컬 오픈소스 LLM 환경으로 변환
+#  - Gradio 기반의 간단한 GUI 제공
+#  - LLM을 이용한 한글 기획서 생성 + python-pptx로 PPT 저장
+#  - diagrams 예제 생성 및 파일로 저장
+#  - matplotlib 그래프 예제(2D 3종) 저장
+#  - 복잡한 3D 그래프 저장
+#
+# 전제
+#  - 로컬 PC에 Ollama가 설치 및 실행 중이며, deepseek-r1 모델이 pull되어 있다고 가정
+#    * 모델 설치(터미널):  ollama pull deepseek-r1
+#    * Ollama 실행 확인:   ollama serve (혹은 백그라운드 서비스)
+#
+# 필요한 패키지 설치(최초 1회)
+#   pip install -U gradio langchain langchain-community python-pptx diagrams matplotlib numpy
+#
+# 주의
+#  - 이 코드는 OpenAI API 키를 사용하지 않습니다.
+#  - LangChain의 ChatOllama를 사용하여 로컬 LLM을 호출합니다.
+# =========================================================
+
+import os
+import re
+import io
+import math
+import time
+import textwrap
+from typing import List, Tuple
+
+# LangChain - Ollama(ChatOllama)
+from langchain_community.chat_models import ChatOllama
+from langchain.schema import HumanMessage, SystemMessage
+
+# PPT 생성
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.enum.text import PP_ALIGN
+
+# Diagrams
+from diagrams import Diagram, Cluster
+from diagrams.generic.compute import Rack
+from diagrams.generic.network import Router, Switch
+from diagrams.generic.storage import Storage
+from diagrams.onprem.client import Users
+from diagrams.onprem.compute import Server
+from diagrams.onprem.database import PostgreSQL
+from diagrams.onprem.queue import Kafka
+
+# 그래프
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import cm
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (3D 등록용)
+
+# GUI
+import gradio as gr
+
+
+# =========================
+# 1) 로컬 LLM(DeepSeek-R1) 준비
+# =========================
+def get_llm(model_name: str = "deepseek-r1", temperature: float = 0.2) -> ChatOllama:
+    """
+    Ollama 로컬 서버에 연결되는 LangChain ChatOllama 래퍼를 생성합니다.
+    - model_name: Ollama 모델 이름 (예: "deepseek-r1", "deepseek-r1:latest" 등)
+    - temperature: 생성 다양성
+    """
+    # Ollama 기본 호스트는 http://localhost:11434
+    # 필요 시 환경변수 OLLAMA_HOST 로 조정 가능
+    return ChatOllama(model=model_name, temperature=temperature)
+
+
+# =========================
+# 2) 기획서 생성 (한국어)
+# =========================
+SYSTEM_PROMPT = """\
+당신은 한국어 비즈니스 기획 전문가입니다.
+간결한 목차 구조(개요/목표/배경/요구사항/보안/예산/일정/성과지표/리스크/결론)를 갖춘
+사내 도입 기획서 초안을 작성하세요. 각 항목은 2~5개의 핵심 불릿으로 요약하세요.
+기업 내 비기술자도 읽기 쉬운 어조로 작성하세요.
+"""
+
+def generate_korean_plan(user_instruction: str, model_name: str = "deepseek-r1") -> str:
+    """
+    로컬 LLM(DeepSeek-R1)을 사용하여 한국어 기획서 초안을 생성합니다.
+    """
+    llm = get_llm(model_name=model_name, temperature=0.2)
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=user_instruction),
+    ]
+    resp = llm(messages)
+    plan_text = resp.content.strip()
+
+    # 가독성 향상을 위해 과도한 공백 정리
+    plan_text = re.sub(r"\n{3,}", "\n\n", plan_text)
+    return plan_text
+
+
+# =========================
+# 3) PPTX 저장 유틸리티
+# =========================
+def split_into_sections(plan_text: str) -> List[Tuple[str, str]]:
+    """
+    헤더(예: '개요', '목표' 등) 기준으로 섹션을 분리합니다.
+    - '제목: 내용' 또는 '## 제목' 형태도 인식하도록 간단한 규칙 적용.
+    반환: [(섹션제목, 섹션본문), ...]
+    """
+    # 후보 헤더 키워드 (한국형 기획서 기본 목차)
+    headers = [
+        "개요", "목표", "배경", "도입 범위", "요구사항", "기능 요구사항", "비기능 요구사항",
+        "보안", "아키텍처", "예산", "일정", "성과지표", "리스크", "결론"
+    ]
+    # 텍스트를 줄 단위로 훑어서 섹션을 뽑는다.
+    lines = plan_text.strip().splitlines()
+    sections = []
+    current_title = "개요"
+    current_buf = []
+
+    def push_section(title, buf):
+        body = "\n".join(buf).strip()
+        if body:
+            sections.append((title, body))
+
+    for ln in lines:
+        ln_stripped = ln.strip().lstrip("-•").strip()
+        # '제목:' 또는 '## 제목' 혹은 볼드/머리글 형태 인식
+        title_match = None
+        if re.match(r"^#{1,6}\s*[\w가-힣]+", ln_stripped):
+            title_match = re.sub(r"^#{1,6}\s*", "", ln_stripped)
+        elif re.match(r"^[\w가-힣 ]{1,30}[:：]$", ln_stripped):
+            title_match = ln_stripped[:-1].strip()
+        elif ln_stripped in headers:
+            title_match = ln_stripped
+
+        if title_match:
+            # 이전 섹션 저장
+            push_section(current_title, current_buf)
+            current_title = title_match
+            current_buf = []
+        else:
+            current_buf.append(ln)
+    # 마지막 섹션 저장
+    push_section(current_title, current_buf)
+
+    # 아무 섹션도 못 나눴으면 전체를 하나로
+    if not sections:
+        sections = [("기획서", plan_text)]
+    return sections
+
+
+def save_plan_to_pptx(plan_text: str, output_path: str = "plan.pptx") -> str:
+    """
+    기획서 텍스트를 섹션별 슬라이드로 저장합니다.
+    """
+    prs = Presentation()
+    title_slide_layout = prs.slide_layouts[0]
+    bullet_slide_layout = prs.slide_layouts[1]
+
+    # 커버 슬라이드
+    slide = prs.slides.add_slide(title_slide_layout)
+    slide.shapes.title.text = "사내 ChatGPT(오픈소스 LLM) 활용 기획서"
+    slide.placeholders[1].text = "자동 생성 초안 • DeepSeek-R1(Ollama) • 로컬 환경"
+
+    sections = split_into_sections(plan_text)
+
+    for title, body in sections:
+        slide = prs.slides.add_slide(bullet_slide_layout)
+        slide.shapes.title.text = title[:40]  # 제목 길이 제한
+
+        # 본문을 불릿으로 분할 (줄바꿈/하이픈 기준)
+        bullets = []
+        for chunk in re.split(r"\n|•|- ", body):
+            c = chunk.strip()
+            if c:
+                # 지나치게 길면 wrap
+                bullets.extend(textwrap.wrap(c, width=80)) if len(c) > 120 else bullets.append(c)
+
+        tf = slide.placeholders[1].text_frame
+        tf.clear()
+        if not bullets:
+            bullets = ["(내용 없음)"]
+
+        # 첫 항목
+        p = tf.paragraphs[0]
+        p.text = bullets[0]
+        p.level = 0
+
+        # 나머지 항목
+        for b in bullets[1:]:
+            p = tf.add_paragraph()
+            p.text = b
+            p.level = 0
+
+    prs.save(output_path)
+    return os.path.abspath(output_path)
+
+
+# =========================
+# 4) Diagrams 예제 생성
+# =========================
+def create_diagram_example(outfile: str = "diagrams/architecture", outformat: str = "png") -> str:
+    """
+    diagrams 라이브러리를 이용하여 간단한 클라우드/온프레믹스 하이브리드 구성을 그림으로 저장합니다.
+    - outfile: 확장자 없는 경로 (diagrams 규칙)
+    - outformat: png/svg 등
+    """
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+    with Diagram("Cloud Web Service (Hybrid)", outformat=outformat, filename=outfile, show=False, graph_attr={"splines": "spline"}):
+        users = Users("Internal Users")
+        edge_rt = Router("Edge Router")
+
+        with Cluster("On-Prem DC"):
+            onprem_sw = Switch("Core Switch")
+            app_srv = Server("App Server")
+            db = PostgreSQL("Primary DB")
+            mq = Kafka("Event Bus")
+            onprem_sw >> app_srv >> db
+            app_srv >> mq
+
+        with Cluster("Cloud VPC"):
+            lb = Router("Public LB")
+            with Cluster("Auto Scaling Group"):
+                web1 = Rack("Web 1")
+                web2 = Rack("Web 2")
+                web3 = Rack("Web 3")
+            obj = Storage("Object Storage")
+
+            lb >> web1
+            lb >> web2
+            lb >> web3
+            web1 >> obj
+            web2 >> obj
+            web3 >> obj
+
+        users >> edge_rt >> lb
+        edge_rt >> onprem_sw
+
+    path = f"{outfile}.{outformat}"
+    return os.path.abspath(path)
+
+
+# =========================
+# 5) 그래프 예제(2D 3종) 저장
+# =========================
+def save_plot(path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    plt.savefig(path, bbox_inches="tight", dpi=180)
+    plt.close()
+
+def create_2d_graph_examples(base_dir: str = "graphs") -> List[str]:
+    """
+    대표적인 2D 그래프 3종을 생성하여 PNG로 저장합니다.
+    - 선형/지수 곡선 라인플롯
+    - 막대 그래프
+    - 산점도 + 회귀선 근사
+    """
+    paths = []
+
+    # 1) 라인 플롯
+    x = np.linspace(0, 10, 200)
+    y1 = np.sin(x) + 0.1 * np.random.randn(len(x))
+    y2 = np.exp(x/5) / np.e**2
+    plt.figure(figsize=(7,4))
+    plt.plot(x, y1, label="sin(x) + noise", lw=2)
+    plt.plot(x, y2, label="exp(x/5)/e^2", lw=2)
+    plt.title("Line Plot Example")
+    plt.xlabel("x"); plt.ylabel("y"); plt.grid(True, alpha=0.3); plt.legend()
+    p1 = os.path.join(base_dir, "line_plot.png")
+    save_plot(p1); paths.append(os.path.abspath(p1))
+
+    # 2) 막대 그래프
+    categories = ["A","B","C","D","E","F"]
+    values = np.random.randint(10, 100, size=len(categories))
+    plt.figure(figsize=(7,4))
+    plt.bar(categories, values, color="#4C78A8")
+    plt.title("Bar Chart Example")
+    plt.xlabel("Category"); plt.ylabel("Value"); plt.grid(True, axis="y", alpha=0.3)
+    p2 = os.path.join(base_dir, "bar_chart.png")
+    save_plot(p2); paths.append(os.path.abspath(p2))
+
+    # 3) 산점도 + 근사선
+    n=200
+    x = np.linspace(-3,3,n)
+    noise = np.random.normal(0,0.6,size=n)
+    y = 0.8*x + 1.5 + noise
+    coeffs = np.polyfit(x, y, 1)  # 1차 회귀
+    y_hat = np.polyval(coeffs, x)
+    plt.figure(figsize=(7,4))
+    plt.scatter(x, y, s=18, alpha=0.6, label="samples")
+    plt.plot(x, y_hat, color="crimson", lw=2, label=f"fit: y={coeffs[0]:.2f}x+{coeffs[1]:.2f}")
+    plt.title("Scatter + Regression")
+    plt.xlabel("x"); plt.ylabel("y"); plt.grid(True, alpha=0.3); plt.legend()
+    p3 = os.path.join(base_dir, "scatter_regression.png")
+    save_plot(p3); paths.append(os.path.abspath(p3))
+
+    return paths
+
+
+# =========================
+# 6) 복잡한 3D 그래프 저장 (Lorenz attractor + 복합 표면)
+# =========================
+def create_complex_3d_graph(path: str = "graphs/complex_3d.png") -> str:
+    """
+    '엄청 복잡하고 어려운' 느낌을 주는 3D 그림:
+      - Lorenz attractor 3D 궤적
+      - 위에 반투명 곡면 하나를 함께 표시
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig = plt.figure(figsize=(8,6))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Lorenz attractor 파라미터
+    sigma, beta, rho = 10.0, 8.0/3.0, 28.0
+    dt = 0.005
+    steps = 40000
+    xs = np.empty(steps); ys = np.empty(steps); zs = np.empty(steps)
+    xs[0], ys[0], zs[0] = (0., 1., 1.05)
+    for i in range(steps-1):
+        x, y, z = xs[i], ys[i], zs[i]
+        xs[i+1] = x + sigma*(y - x)*dt
+        ys[i+1] = y + (x*(rho - z) - y)*dt
+        zs[i+1] = z + (x*y - beta*z)*dt
+
+    ax.plot(xs, ys, zs, lw=0.5, color="#2E86AB", alpha=0.9, label="Lorenz Attractor")
+
+    # 복합 곡면 (예: sinc 기반)
+    X = np.linspace(-10, 10, 200)
+    Y = np.linspace(-10, 10, 200)
+    X, Y = np.meshgrid(X, Y)
+    R = np.sqrt(X**2 + Y**2) + 1e-6
+    Z = np.sin(R) / R
+    ax.plot_surface(X, Y, Z*5 - 20, rstride=10, cstride=10, cmap=cm.viridis, alpha=0.35, edgecolor='none')
+
+    ax.set_title("Complex 3D Visualization: Lorenz + Surface")
+    ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
+    ax.view_init(elev=25, azim=35)
+    plt.tight_layout()
+    plt.savefig(path, bbox_inches="tight", dpi=220)
+    plt.close()
+    return os.path.abspath(path)
+
+
+# =========================
+# 7) Gradio UI
+# =========================
+DEFAULT_PROMPT = "사내에서 오픈소스 LLM(DeepSeek-R1)을 활용하는 도입 기획서 초안을 작성해주세요. 핵심 항목별로 불릿 정리."
+
+def ui_generate_plan(user_prompt: str, model_name: str):
+    """
+    버튼 클릭 시:
+      1) LLM으로 한국어 기획서 생성
+      2) plan.pptx로 저장
+      3) 결과 텍스트와 파일 경로 반환
+    """
+    try:
+        plan = generate_korean_plan(user_prompt.strip() or DEFAULT_PROMPT, model_name=model_name)
+        pptx_path = save_plan_to_pptx(plan, "plan.pptx")
+        return plan, pptx_path
+    except Exception as e:
+        return f"[오류] 기획서 생성 실패: {e}", ""
+
+def ui_create_diagram():
+    try:
+        path = create_diagram_example("diagrams/architecture", "png")
+        return path
+    except Exception as e:
+        return f"[오류] 다이어그램 생성 실패: {e}"
+
+def ui_create_2d_graphs():
+    try:
+        paths = create_2d_graph_examples("graphs")
+        # Gradio Gallery에 맞는 형식으로 반환 (이미지 경로 리스트)
+        return paths
+    except Exception as e:
+        return [f"[오류] 그래프 생성 실패: {e}"]
+
+def ui_create_complex_3d():
+    try:
+        path = create_complex_3d_graph("graphs/complex_3d.png")
+        return path
+    except Exception as e:
+        return f"[오류] 3D 그래프 생성 실패: {e}"
+
+
+with gr.Blocks(title="OpenCode • DeepSeek-R1 (Ollama) Toolkit") as demo:
+    gr.Markdown(
+        """
+        # OpenCode • DeepSeek-R1 (Ollama) Toolkit
+        로컬 오픈소스 LLM + Python 자동화 샘플  
+        - **LLM**: DeepSeek-R1 (Ollama)  
+        - **GUI**: Gradio  
+        - **기능**: 한글 기획서 생성 → PPTX 저장, Diagrams 예제, 2D 그래프(3종), 복잡한 3D 그래프
+        """
+    )
+
+    with gr.Tab("1) 기획서 생성 → PPTX"):
+        model_name = gr.Textbox(value="deepseek-r1", label="Ollama 모델명", info="예: deepseek-r1 또는 deepseek-r1:latest")
+        prompt = gr.Textbox(value=DEFAULT_PROMPT, lines=6, label="프롬프트(한국어)", show_label=True)
+        btn = gr.Button("기획서 생성 및 plan.pptx 저장", variant="primary")
+        plan_out = gr.Textbox(label="생성된 기획서 텍스트", lines=18)
+        pptx_file = gr.File(label="생성된 PPTX 파일 (plan.pptx)", interactive=False)
+        btn.click(ui_generate_plan, inputs=[prompt, model_name], outputs=[plan_out, pptx_file])
+
+    with gr.Tab("2) Diagrams 예제"):
+        gr.Markdown("diagrams 라이브러리를 이용해 하이브리드 아키텍처 예제를 생성하고 PNG로 저장합니다.")
+        btn2 = gr.Button("다이어그램 생성")
+        diagram_path = gr.Textbox(label="저장 경로", interactive=False)
+        btn2.click(fn=lambda: ui_create_diagram(), inputs=None, outputs=diagram_path)
+
+    with gr.Tab("3) 그래프 예제(2D 3종)"):
+        gr.Markdown("라인/막대/산점도+회귀선 예제를 각각 PNG로 저장합니다.")
+        btn3 = gr.Button("그래프 3종 생성")
+        gallery = gr.Gallery(label="생성 이미지 미리보기", columns=3, height=300)
+        btn3.click(fn=lambda: ui_create_2d_graphs(), inputs=None, outputs=gallery)
+
+    with gr.Tab("4) 복잡한 3D 그래프"):
+        gr.Markdown("Lorenz attractor + 복합 곡면을 포함한 3D 시각화를 생성합니다.")
+        btn4 = gr.Button("3D 그래프 생성")
+        path3d = gr.Textbox(label="저장 경로", interactive=False)
+        btn4.click(fn=lambda: ui_create_complex_3d(), inputs=None, outputs=path3d)
+
+    gr.Markdown(
+        """
+        ### 사용 팁
+        - **모델 준비**: `ollama pull deepseek-r1` 실행 후 앱을 사용하세요.
+        - **파일 저장 위치**: `plan.pptx`, `diagrams/architecture.png`, `graphs/*.png`
+        - **오류 발생 시**: Ollama 서버 실행 여부와 패키지 설치 상태를 확인하세요.
+        """
+    )
+
+if __name__ == "__main__":
+    # 로컬 웹 UI 실행
+    demo.launch()
+
+

@@ -1,0 +1,156 @@
+#54
+# restaurant_review_chain_ollama.py
+# ------------------------------------------------------------
+# 오픈소스 LLM(DeepSeek-R1, Ollama 로컬) + Gradio
+# 기존 LangChain(OpenAI) 체인:
+#   1) 리뷰 요약 -> 2) 0~10 감성 점수(숫자만) -> 3) 공손한 답변
+# 을 동일 단계로 재현합니다.
+# ------------------------------------------------------------
+
+import re
+import requests
+import gradio as gr
+from typing import Optional
+
+OLLAMA_HOST = "http://localhost:11434"
+DEFAULT_MODEL = "deepseek-r1"   # 필요 시: `ollama pull deepseek-r1`
+
+# -----------------------------
+# DeepSeek 계열 출력 정리 유틸
+# -----------------------------
+def strip_think(text: str) -> str:
+    """DeepSeek-R1이 출력하는 <think>...</think> 내부 사고 과정을 제거."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+# -----------------------------
+# Ollama 호출
+# -----------------------------
+def ollama_generate(prompt: str, model: str = DEFAULT_MODEL, temperature: float = 0.7, host: str = OLLAMA_HOST) -> str:
+    """
+    Ollama /api/generate 호출 (non-stream).
+    """
+    resp = requests.post(
+        f"{host}/api/generate",
+        json={"model": model, "prompt": prompt, "temperature": temperature, "stream": False},
+        timeout=60,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Ollama 호출 실패(status={resp.status_code}): {resp.text[:300]}")
+    data = resp.json()
+    return data.get("response", "")
+
+# -----------------------------
+# 체인 1: 요약
+# -----------------------------
+def summarize_review(review: str, model: str, temperature: float) -> str:
+    """
+    입력 리뷰를 한 문장으로 요약.
+    """
+    prompt = (
+        "다음 식당 리뷰를 한국어로 한 문장으로 자연스럽게 요약하세요.\n\n"
+        f"리뷰:\n{review}\n\n"
+        "요약은 1문장만 출력하세요."
+    )
+    raw = ollama_generate(prompt, model=model, temperature=temperature)
+    return strip_think(raw)
+
+# -----------------------------
+# 체인 2: 감성 점수(0~10)
+# -----------------------------
+def score_sentiment(review: str, model: str, temperature: float) -> str:
+    """
+    리뷰를 읽고 0~10 사이 '정수 한 개'만 출력하도록 강제.
+    """
+    prompt = (
+        "다음 식당 리뷰의 전반적 만족도를 0~10 사이 **정수 한 개**로 평가하세요.\n"
+        "- 0은 매우 부정적, 10은 매우 긍정적입니다.\n"
+        "- 반드시 숫자만 출력하세요(예: 7).\n\n"
+        f"리뷰:\n{review}"
+    )
+    raw = ollama_generate(prompt, model=model, temperature=temperature)
+    cleaned = strip_think(raw)
+    # 첫 번째 정수 추출
+    m = re.search(r"\b([0-9]|10)\b", cleaned)
+    if not m:
+        # 숫자를 못 찾은 경우, 안전한 기본값 5 반환
+        return "5"
+    return m.group(1)
+
+# -----------------------------
+# 체인 3: 공손한 답변
+# -----------------------------
+def polite_reply(summary: str, model: str, temperature: float) -> str:
+    """
+    요약을 바탕으로 공손하고 간결한 답변 작성.
+    """
+    prompt = (
+        "아래 식당 리뷰 요약에 대해, 서비스 제공자(식당) 입장에서 공손하고 간결한 한국어 답변을 작성하세요.\n"
+        "- 2~4문장\n- 과도한 사과/홍보는 피하고, 개선 의지와 감사 표현을 균형 있게 포함\n\n"
+        f"리뷰 요약:\n{summary}"
+    )
+    raw = ollama_generate(prompt, model=model, temperature=temperature)
+    return strip_think(raw)
+# -----------------------------
+# 전체 파이프라인
+# -----------------------------
+def run_chain(review: str, model: str, temperature: float):
+    """
+    1) 요약 -> 2) 점수 -> 3) 답변
+    """
+    review = (review or "").strip()
+    if not review:
+        return "리뷰를 입력하세요.", "", ""
+
+    try:
+        summary = summarize_review(review, model, temperature)
+    except Exception as e:
+        return f"[요약 오류] {e}", "", ""
+
+    try:
+        score = score_sentiment(review, model, temperature)
+    except Exception as e:
+        return summary, f"[점수 오류] {e}", ""
+
+    try:
+        reply = polite_reply(summary, model, temperature)
+    except Exception as e:
+        return summary, score, f"[답변 오류] {e}"
+
+    return summary, score, reply
+
+# -----------------------------
+# Gradio UI
+# -----------------------------
+EX_REVIEW = """이 식당은 맛도 좋고 분위기도 좋았습니다. 가격 대비 만족도가 높아요.
+하지만, 서비스 속도가 너무 느려서 조금 실망스러웠습니다.
+전반적으로는 다시 방문할 의사가 있습니다.
+"""
+
+with gr.Blocks(title="OpenCode - 식당 리뷰 체인 (Ollama + DeepSeek-R1)") as demo:
+    gr.Markdown("## 🧩 식당 리뷰 체인\n로컬 **Ollama + DeepSeek-R1**로 동작합니다. API Key가 필요 없습니다.")
+
+    with gr.Row():
+        review_tb = gr.Textbox(label="식당 리뷰 입력", value=EX_REVIEW, lines=8, placeholder="리뷰를 입력하세요.")
+    with gr.Row():
+        model_tb = gr.Textbox(label="모델 이름", value=DEFAULT_MODEL, placeholder="예: deepseek-r1 / qwen2.5:14b 등")
+        temp_sl = gr.Slider(0.0, 1.5, value=0.7, step=0.1, label="Temperature")
+
+    run_btn = gr.Button("체인 실행")
+
+    with gr.Row():
+        out_summary = gr.Textbox(label="요약 (체인1)", lines=3)
+    with gr.Row():
+        out_score = gr.Textbox(label="감성 점수 0~10 (체인2)", lines=1)
+    with gr.Row():
+        out_reply = gr.Textbox(label="공손한 답변 (체인3)", lines=6)
+
+    run_btn.click(
+        fn=run_chain,
+        inputs=[review_tb, model_tb, temp_sl],
+        outputs=[out_summary, out_score, out_reply]
+    )
+
+if __name__ == "__main__":
+    # 첫 실행 전 모델 설치 필요:
+    #   $ ollama pull deepseek-r1
+    demo.launch()

@@ -1,0 +1,417 @@
+#78 (제미나이)
+"""
+Gemini(google-generativeai) 예제를
+오픈소스 LLM(DeepSeek-R1, Ollama 로컬 서버) + Gradio GUI로 변환한 파이썬 스크립트.
+
+■ 전제
+- 로컬 PC에 Ollama가 설치되어 있고 deepseek-r1(또는 deepseek-r1:32b 등) 모델이 pull 되어 있음
+  예) 터미널에서:  ollama pull deepseek-r1
+- 네트워크 키(API key) 사용하지 않음. (로컬 http://localhost:11434 로 통신)
+
+■ 포함 기능 (원본 Gemini 코드와 기능 매핑)
+1) 모델 목록 표시               -> Ollama 모델 리스트 출력
+2) 단발성 추론(비스트리밍/스트리밍) -> generate(stream=False/True)
+3) 채팅 세션 유지                -> chat(messages 누적, stream 가능)
+4) 대화 이력 확인                -> 내부 history 출력
+5) 생성 파라미터                 -> temperature, num_predict(max tokens), stop(sequences)
+6) 시스템 프롬프트               -> system role 메시지
+7) JSON 모드 출력                -> Ollama 옵션 format="json" 활용 + json.loads 파싱
+8) 토큰 수 세기                  -> Ollama /api/tokenize 엔드포인트 호출로 토큰 길이 측정
+9) (옵션) 간단 안전설정 흉내      -> 매우 단순한 금칙어 필터 예시(로컬 가드레일)
+10) Gradio GUI                  -> 싱글 프롬프트 탭 + 채팅 탭 제공
+
+작성: OpenCode
+"""
+
+# ========================
+# 필요한 패키지 설치(최초 1회)
+# ========================
+try:
+    import ollama  # Ollama Python SDK
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "ollama"])
+    import ollama
+
+try:
+    import gradio as gr
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "gradio>=4.44.0", "requests"])
+    import gradio as gr
+
+import json
+import time
+import requests
+from typing import List, Dict, Any
+
+# =====================================
+# 설정: 로컬 Ollama 서버 정보
+# =====================================
+OLLAMA_HOST = "http://localhost:11434"  # 기본값
+
+# =====================================
+# 유틸: 모델 목록 조회
+# =====================================
+def list_ollama_models() -> List[str]:
+    """로컬 Ollama에 설치된 모델 이름 리스트를 반환한다."""
+    try:
+        client = ollama.Client(host=OLLAMA_HOST)
+        res = client.list()
+        models = [m["model"] for m in res.get("models", [])]
+        return models
+    except Exception as e:
+        print("[경고] 모델 리스트 조회 실패:", e)
+        return []
+
+# =====================================
+# 유틸: 토큰 수 세기 (Ollama /api/tokenize)
+# =====================================
+def count_tokens(model: str, text: str) -> int:
+    """주어진 모델의 토크나이저로 문자열을 토크나이즈하여 토큰 수를 반환한다."""
+    try:
+        url = f"{OLLAMA_HOST}/api/tokenize"
+        resp = requests.post(url, json={"model": model, "prompt": text}, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        return len(data.get("tokens", []))
+    except Exception as e:
+        print("[경고] 토큰 카운트 실패:", e)
+        return -1
+
+# =====================================
+# 유틸: 간단 가드레일(옵션)
+# =====================================
+BLOCKLIST = {"멍청", "바보", "어리석"}  # 매우 단순한 예시(실서비스에는 적합하지 않음)
+
+def guardrail_check(text: str) -> bool:
+    """금칙어가 포함되어 있으면 True(차단) 반환."""
+    t = text.replace(" ", "")
+    return any(b in t for b in BLOCKLIST)
+
+# =====================================
+# 1) 단발성 추론 (generate)
+# =====================================
+
+def generate_once(model: str, prompt: str, temperature: float = 1.0, max_tokens: int = 512, stops: str = "", system_prompt: str = "") -> str:
+    """스트리밍 없이 한 번에 텍스트를 생성한다."""
+    client = ollama.Client(host=OLLAMA_HOST)
+    options = {
+        "temperature": float(temperature),
+        "num_predict": int(max_tokens),
+    }
+    if stops.strip():
+        options["stop"] = [s for s in stops.split("||") if s]
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    # 간단 가드레일(옵션): 입력 차단
+    if guardrail_check(prompt):
+        return "[가드레일] 입력에 금칙어가 포함되어 생성이 차단되었습니다."
+
+    try:
+        # DeepSeek-R1는 "reasoning" 스타일 출력을 할 수 있음. 일반 chat 사용.
+        res = client.chat(model=model, messages=messages, options=options)
+        return res.get("message", {}).get("content", "")
+    except Exception as e:
+        return f"[에러] 생성 실패: {e}"
+
+# =====================================
+# 2) 스트리밍 단발성 추론
+# =====================================
+
+def generate_stream(model: str, prompt: str, temperature: float = 1.0, max_tokens: int = 512, stops: str = "", system_prompt: str = ""):
+    """제너레이터를 반환하여 토큰 단위로 스트리밍한다."""
+    client = ollama.Client(host=OLLAMA_HOST)
+    options = {
+        "temperature": float(temperature),
+        "num_predict": int(max_tokens),
+    }
+    if stops.strip():
+        options["stop"] = [s for s in stops.split("||") if s]
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    # 간단 가드레일(옵션): 입력 차단
+    if guardrail_check(prompt):
+        yield "[가드레일] 입력에 금칙어가 포함되어 생성이 차단되었습니다."
+        return
+
+    try:
+        stream = client.chat(model=model, messages=messages, options=options, stream=True)
+        for chunk in stream:
+            yield chunk.get("message", {}).get("content", "")
+    except Exception as e:
+        yield f"[에러] 스트리밍 실패: {e}"
+
+# =====================================
+# 3) 채팅 세션 관리
+# =====================================
+class ChatSession:
+    def __init__(self, model: str, system_prompt: str = ""):
+        self.client = ollama.Client(host=OLLAMA_HOST)
+        self.model = model
+        self.history: List[Dict[str, str]] = []
+        if system_prompt:
+            self.history.append({"role": "system", "content": system_prompt})
+
+    def send(self, user_text: str, temperature: float = 1.0, max_tokens: int = 512, stops: str = "") -> str:
+        if guardrail_check(user_text):
+            return "[가드레일] 입력에 금칙어가 포함되어 생성이 차단되었습니다."
+        options = {
+            "temperature": float(temperature),
+            "num_predict": int(max_tokens),
+        }
+        if stops.strip():
+            options["stop"] = [s for s in stops.split("||") if s]
+
+        self.history.append({"role": "user", "content": user_text})
+        try:
+            res = self.client.chat(model=self.model, messages=self.history, options=options)
+            reply = res.get("message", {}).get("content", "")
+            self.history.append({"role": "assistant", "content": reply})
+            return reply
+        except Exception as e:
+            return f"[에러] 채팅 실패: {e}"
+
+    def stream(self, user_text: str, temperature: float = 1.0, max_tokens: int = 512, stops: str = ""):
+        if guardrail_check(user_text):
+            yield "[가드레일] 입력에 금칙어가 포함되어 생성이 차단되었습니다."
+            return
+        options = {
+            "temperature": float(temperature),
+            "num_predict": int(max_tokens),
+        }
+        if stops.strip():
+            options["stop"] = [s for s in stops.split("||") if s]
+
+        # 기록에 사용자 메시지 추가 후 스트림 시작
+        self.history.append({"role": "user", "content": user_text})
+        try:
+            stream = self.client.chat(model=self.model, messages=self.history, options=options, stream=True)
+            assistant_accum = ""
+            for chunk in stream:
+                piece = chunk.get("message", {}).get("content", "")
+                assistant_accum += piece
+                yield piece
+            # 스트리밍 종료 후 누적 응답을 히스토리에 추가
+            self.history.append({"role": "assistant", "content": assistant_accum})
+        except Exception as e:
+            yield f"[에러] 채팅 스트리밍 실패: {e}"
+
+# =====================================
+# 4) JSON 모드 예시 (format="json")
+# =====================================
+
+def generate_json(model: str, instruction: str, json_schema_hint: str = "") -> Any:
+    """
+    모델에 JSON만 출력하도록 지시하고 파싱하여 반환한다.
+    - Ollama 옵션 format="json" 사용 (지원 모델에서 유효)
+    - schema를 강제할 수는 없지만, 프롬프트로 형식을 지시
+    """
+    client = ollama.Client(host=OLLAMA_HOST)
+    prompt = (
+        "아래 지시에 따라 JSON만 출력하세요. 설명 텍스트를 쓰지 마세요.\n" +
+        (f"출력 스키마 힌트:\n{json_schema_hint}\n" if json_schema_hint else "") +
+        f"지시:\n{instruction}\n"
+    )
+    try:
+        res = client.generate(model=model, prompt=prompt, options={"format": "json", "num_predict": 512})
+        text = res.get("response", "").strip()
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # JSON 모드인데도 실패할 경우(일부 모델 호환성 문제), 수동 복구 시도
+        text = res.get("response", "") if isinstance(res, dict) else str(res)
+        text = text.strip().strip("` ")
+        try:
+            return json.loads(text)
+        except Exception:
+            return {"_raw": text, "_error": "JSON 파싱 실패"}
+    except Exception as e:
+        return {"_error": f"JSON 생성 실패: {e}"}
+
+# =====================================
+# 5) 데모(원본 예제에 해당하는 호출들)
+# =====================================
+
+def demo_prints(default_model: str):
+    print("# 모델 목록 표시")
+    print(list_ollama_models())
+
+    print("\n# 추론 실행 (비스트리밍)")
+    text = generate_once(default_model, "Google DeepMind에 관해 알려주세요.")
+    print(text)
+
+    print("\n# 추론 실행 (스트리밍)")
+    for piece in generate_stream(default_model, "Google DeepMind에 관해 알려주세요."):
+        print(piece, end="", flush=True)
+    print("\n--끝--\n")
+
+    print("# 채팅 준비 및 대화")
+    chat = ChatSession(default_model)
+    print(chat.send("내가 키우는 고양이의 이름은 레오입니다."))
+    print(chat.send("내가 키우는 고양이를 불러보세요."))
+
+    print("\n# 대화 이력 확인")
+    for m in chat.history:
+        role = m.get("role"); content = m.get("content")
+        print(role, ":", content[:120] + ("..." if len(content) > 120 else ""))
+
+    print("\n# 생성 파라미터 사용 예시")
+    story = generate_once(
+        default_model,
+        "사이버 펑크 스타일의 빨간 모자 이야기를 써주세요",
+        temperature=1.0,
+        max_tokens=500,
+        stops="\n\n",  # Gemini의 stop_sequences에 대응: 여러 개는 'A||B' 형식
+    )
+    print(story)
+
+    print("\n# 토큰 수 확인")
+    print("영문 토큰 수:", count_tokens(default_model, "Hello World!"))
+    print("한글 토큰 수:", count_tokens(default_model, "안녕하세요, 세상!"))
+
+    print("\n# (옵션) 가드레일 없는 생성")
+    rude = generate_once(default_model, "너는 너무 어리석어!")
+    print(rude)
+
+    print("\n# (옵션) 간단 가드레일 켠 상태 시뮬레이션")
+    # 실제로는 guardrail_check가 입력에만 적용되므로 예시 문구를 금칙어 포함으로 바꿔봄
+    rude_block = generate_once(default_model, "너는 너무 어리석은 바보야!")
+    print(rude_block)
+
+    print("\n# 시스템 프롬프트 적용")
+    story_sys = generate_once(
+        default_model,
+        "안녕하세요. 당신의 이름은 무엇인가요?",
+        system_prompt="당신의 이름은 '콩이'다. 자신을 부를 때는 '나'라고 하고, 말끝에는 '~다'나 '~란다'를 붙여서 대화한다.",
+    )
+    print(story_sys)
+
+    print("\n# JSON 모드 출력")
+    schema_hint = """Recipe = {\n  \"recipe_name\": string\n}\nReturn: list[Recipe]\n"""
+    j = generate_json(default_model, "유명한 쿠키 레시피를 한국어로 5개를 리스트업 해주세요", json_schema_hint=schema_hint)
+    print(type(j), j)
+
+# =====================================
+# 6) Gradio GUI
+# =====================================
+
+def build_gradio(models: List[str], default_model: str = "deepseek-r1"):
+    with gr.Blocks(title="OpenCode: Ollama(DeepSeek-R1) Playground", theme=gr.themes.Soft()) as demo:
+        gr.Markdown("""
+        # 🐍 OpenCode • Ollama(DeepSeek-R1) + Gradio
+        로컬 Ollama 모델로 Gemini 예제를 대체한 데모입니다. 좌측에서 모델을 선택하고, 탭에서 기능을 사용하세요.
+        """)
+        with gr.Row():
+            model_dd = gr.Dropdown(models or [default_model], value=(default_model if default_model in models else (models[0] if models else default_model)), label="모델")
+            temp = gr.Slider(0.0, 2.0, value=1.0, step=0.1, label="temperature")
+            max_tok = gr.Slider(16, 4096, value=512, step=16, label="max_tokens (num_predict)")
+            stops = gr.Textbox(value="", placeholder="여러 개는 'A||B' 로 구분", label="stop sequences")
+        sys_prompt = gr.Textbox(value="", label="시스템 프롬프트", lines=2)
+
+        with gr.Tabs():
+            with gr.Tab("Single Prompt"):
+                user_prompt = gr.Textbox(value="Google DeepMind에 관해 알려주세요.", lines=4, label="프롬프트")
+                stream_ck = gr.Checkbox(value=False, label="스트리밍 출력")
+                out = gr.Textbox(label="응답")
+                btn = gr.Button("실행", variant="primary")
+
+                def run_single(m, p, t, n, s, sp, st):
+                    if st:
+                        chunks = []
+                        for piece in generate_stream(m, p, t, n, s, sp):
+                            chunks.append(piece)
+                            yield "".join(chunks)
+                    else:
+                        text = generate_once(m, p, t, n, s, sp)
+                        yield text
+
+                btn.click(run_single, [model_dd, user_prompt, temp, max_tok, stops, sys_prompt, stream_ck], out)
+
+            with gr.Tab("Chat"):
+                gr.Markdown("채팅은 세션별로 메시지를 유지합니다. 새 세션을 시작하려면 '새 채팅'을 누르세요.")
+                chatbox = gr.Chatbot(height=400)
+                chat_input = gr.Textbox(placeholder="메시지를 입력하세요…", lines=2)
+                stream_ck2 = gr.Checkbox(value=True, label="스트리밍")
+                new_chat = gr.Button("새 채팅", variant="secondary")
+
+                # 세션 상태: (ChatSession 인스턴스, model, sys_prompt)
+                state = gr.State(value=None)
+
+                def ensure_session(sess, m, sp):
+                    if sess is None or getattr(sess, "model", None) != m:
+                        return ChatSession(m, sp)
+                    # 시스템 프롬프트가 바뀌면 새로 생성
+                    has_sys = any(msg.get("role") == "system" for msg in sess.history)
+                    if (sp and not has_sys) or (has_sys and sess.history[0].get("content") != sp):
+                        return ChatSession(m, sp)
+                    return sess
+
+                def on_send(sess, history, m, sp, text, t, n, s, streaming):
+                    sess = ensure_session(sess, m, sp)
+                    if streaming:
+                        # 스트리밍: yield 단계적으로 chatbox 업데이트
+                        partial = ""
+                        for piece in sess.stream(text, t, n, s):
+                            partial += piece
+                            yield sess, history + [(text, partial)]
+                        return  # 제너레이터 종료
+                    else:
+                        reply = sess.send(text, t, n, s)
+                        history = (history or []) + [(text, reply)]
+                        return sess, history
+
+                def on_new_chat():
+                    return None, []
+
+                chat_input.submit(on_send, [state, chatbox, model_dd, sys_prompt, chat_input, temp, max_tok, stops, stream_ck2], [state, chatbox])
+                new_chat.click(on_new_chat, outputs=[state, chatbox])
+
+            with gr.Tab("JSON Mode"):
+                gr.Markdown("Ollama 옵션 format=\"json\"를 이용해 JSON만 출력하도록 지시합니다.")
+                instr = gr.Textbox(value="유명한 쿠키 레시피를 한국어로 5개를 리스트업 해주세요", lines=3, label="지시문")
+                schema = gr.Textbox(value="Recipe = {\n  \"recipe_name\": string\n}\nReturn: list[Recipe]", lines=4, label="스키마 힌트(선택)")
+                json_out = gr.Code(language="json", label="JSON 출력")
+                btn_json = gr.Button("생성")
+
+                def run_json(m, i, sh):
+                    return json.dumps(generate_json(m, i, sh), ensure_ascii=False, indent=2)
+
+                btn_json.click(run_json, [model_dd, instr, schema], json_out)
+
+            with gr.Tab("Token Count"):
+                gr.Markdown("모델 토크나이저로 길이를 측정합니다.")
+                txt = gr.Textbox(value="Hello World!", label="텍스트")
+                tok_out = gr.Number(label="토큰 수")
+                btn_tok = gr.Button("카운트")
+                btn_tok.click(lambda m, x: count_tokens(m, x), [model_dd, txt], tok_out)
+
+        gr.Markdown("""
+        ---
+        **팁**  
+        - 여러 stop 시퀀스는 `A||B` 처럼 `||` 로 구분하세요.  
+        - DeepSeek-R1은 사고의 흔적(Reasoning)을 출력할 수 있습니다. 필요 시 시스템 프롬프트로 스타일을 통제하세요.  
+        - JSON 모드는 모델/버전에 따라 정확도가 다를 수 있습니다.
+        """)
+    return demo
+
+# =====================================
+# 메인 실행부
+# =====================================
+if __name__ == "__main__":
+    models = list_ollama_models()
+    default = "deepseek-r1" if ("deepseek-r1" in models) else (models[0] if models else "deepseek-r1")
+
+    # 콘솔 데모 호출을 원하면 주석 해제
+    # demo_prints(default)
+
+    app = build_gradio(models, default)
+    # 브라우저 자동 오픈을 원하면 share=True 사용 가능(로컬 네트워크 노출 주의)
+    app.launch(server_name="0.0.0.0", server_port=7860, share=False)

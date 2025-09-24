@@ -1,0 +1,228 @@
+#85
+"""
+OpenCode 변환본: OpenAI 전용 코드(환경변수·API Key·OpenAI 클라이언트 사용)를
+오픈소스 LLM(DeepSeek-R1 @ Ollama) 기반, API Key 불필요한 로컬 실행 + Gradio GUI로 변환한 스크립트입니다.
+
+✅ 전제
+- 로컬 PC에 Ollama가 설치되어 있고 deepseek-r1 모델을 받아두었다고 가정합니다.
+  설치 예) https://ollama.com  /  모델 받기: `ollama pull deepseek-r1`
+- 인터넷/클라우드 필요 없음. API Key도 필요 없음.
+
+📦 파이썬 패키지
+- gradio, ollama
+  설치:  pip install gradio ollama
+"""
+
+import re
+import time
+from typing import List, Tuple, Generator, Optional
+
+import gradio as gr
+import ollama  # 로컬 Ollama 서버(기본 http://localhost:11434)에 연동
+
+
+# ==============================
+# DeepSeek-R1의 내부 추론(<think>...</think>) 숨김 유틸
+# ==============================
+THINK_TAG_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+def strip_think(text: str) -> str:
+    """
+    DeepSeek-R1은 내부 추론을 <think>...</think>으로 출력하기도 합니다.
+    사용자가 보지 않도록 해당 블록을 제거합니다.
+    """
+    return THINK_TAG_PATTERN.sub("", text).strip()
+
+
+# ==============================
+# 단일 요청(비스트리밍) — OpenAI chat.completions.create 대체
+# ==============================
+def local_chat_complete(
+    prompt: str,
+    model: str = "deepseek-r1",
+    max_tokens: int = 256,
+    temperature: float = 0.7,
+    system: Optional[str] = None,
+) -> str:
+    """
+    OpenAI의 `client.chat.completions.create(...)`와 유사한 사용감을
+    로컬 Ollama API로 재현합니다(단순화).
+    - messages: (system) + user 1턴만 처리(필요하면 history로 확장 가능)
+    """
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    resp = ollama.chat(
+        model=model,
+        messages=messages,
+        options={
+            "num_predict": int(max_tokens),   # 최대 생성 토큰
+            "temperature": float(temperature) # 창의성/랜덤성
+        }
+    )
+    content = resp.get("message", {}).get("content", "")
+    return strip_think(content)
+
+
+# ==============================
+# 스트리밍 채팅 — Gradio ChatInterface용
+# ==============================
+def chat_stream(
+    history: List[Tuple[str, str]],
+    message: str,
+    model: str = "deepseek-r1",
+    temperature: float = 0.7,
+    max_tokens: int = 256,
+    system: Optional[str] = None,
+) -> Generator[Tuple[List[Tuple[str, str]], str], None, None]:
+    """
+    Gradio ChatInterface와 호환되는 스트리밍 응답 함수.
+    - Ollama의 stream=True를 사용하여 토큰 단위로 흘려보냅니다.
+    - <think> 블록은 매 토큰 누적 버퍼에서 제거해 가공 후 노출합니다.
+    """
+    # 대화 기록에 사용자 메시지 추가
+    history = history + [(message, "")]
+
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": message})
+
+    stream = ollama.chat(
+        model=model,
+        messages=messages,
+        stream=True,
+        options={
+            "num_predict": int(max_tokens),
+            "temperature": float(temperature),
+        },
+    )
+
+    buffer = ""   # 모델 원본 누적
+    visible = ""  # 사용자 노출용(think 제거) 누적
+    for chunk in stream:
+        delta = chunk.get("message", {}).get("content", "")
+        if not delta:
+            continue
+        buffer += delta
+
+        # 매 스텝마다 내부 추론 제거
+        clean = strip_think(buffer)
+        # 증분만 반영하여 깜빡임 감소
+        inc = clean[len(visible):]
+        if inc:
+            visible += inc
+            history[-1] = (message, visible)
+            yield history, None
+        time.sleep(0.01)  # 과도한 업데이트 속도 완화
+
+    # 종료 시 최종 정리
+    history[-1] = (message, strip_think(buffer))
+    yield history, None
+
+
+# ==============================
+# Gradio UI — OpenAI 예제의 “시 생성” 데모 포함
+# ==============================
+def build_app():
+    with gr.Blocks(title="DeepSeek-R1 (Local · Ollama)") as demo:
+        gr.Markdown(
+            """
+            # 🧠 DeepSeek-R1 (로컬 · Ollama)
+            - OpenAI API Key 없이 완전 로컬로 동작합니다.
+            - 내부 추론(`<think>...</think>`)은 자동으로 숨깁니다.
+            """
+        )
+
+        with gr.Tab("단일 요청(시 생성 데모)"):
+            gr.Markdown(
+                "> OpenAI 예제의 `client.chat.completions.create(model='gpt-4o', ... )`를\n"
+                "> 로컬 LLM 호출로 바꾼 간단 폼입니다."
+            )
+            with gr.Row():
+                sys = gr.Textbox(
+                    label="System 메시지(선택)",
+                    placeholder="어시스턴트의 말투/역할을 정의할 수 있습니다.",
+                    value="당신은 간결하고 창의적인 작시(詩) 어시스턴트입니다."
+                )
+            with gr.Row():
+                prompt = gr.Textbox(
+                    label="User 메시지",
+                    lines=4,
+                    value="AI에 대한 시를 하나 작성해줘"
+                )
+            with gr.Row():
+                model = gr.Textbox(value="deepseek-r1", label="모델(로컬 Ollama 태그)", interactive=True)
+                max_tokens = gr.Slider(32, 1024, value=256, step=1, label="최대 생성 토큰")
+                temperature = gr.Slider(0.0, 1.5, value=0.7, step=0.05, label="온도(창의성)")
+
+            run_btn = gr.Button("생성하기", variant="primary")
+            out = gr.Textbox(label="응답", lines=10, show_copy_button=True)
+
+            def on_run(system_text, user_text, model_tag, max_t, temp):
+                return local_chat_complete(
+                    prompt=user_text,
+                    model=model_tag,
+                    max_tokens=int(max_t),
+                    temperature=float(temp),
+                    system=system_text.strip() or None,
+                )
+
+            run_btn.click(on_run, inputs=[sys, prompt, model, max_tokens, temperature], outputs=[out])
+
+        with gr.Tab("대화형 채팅(스트리밍)"):
+            with gr.Row():
+                model2 = gr.Textbox(value="deepseek-r1", label="모델(로컬 Ollama 태그)", interactive=True)
+                temperature2 = gr.Slider(0.0, 1.5, value=0.7, step=0.05, label="온도")
+                max_tokens2 = gr.Slider(16, 2048, value=256, step=1, label="최대 생성 토큰")
+                sys2 = gr.Textbox(
+                    label="System 메시지(선택)",
+                    value="당신은 유용하고 정중한 한국어 어시스턴트입니다."
+                )
+
+            chat = gr.ChatInterface(
+                fn=lambda history, message, m, t, mt, s: chat_stream(
+                    history, message, model=m, temperature=t, max_tokens=mt, system=s
+                ),
+                additional_inputs=[model2, temperature2, max_tokens2, sys2],
+                title="로컬 LLM 채팅",
+                chatbot=gr.Chatbot(height=420, likeable=True, show_copy_button=True),
+                textbox=gr.Textbox(placeholder="메시지를 입력하세요...", lines=2),
+                cache_examples=False,
+                clear_btn="대화 지우기",
+                retry_btn=None,
+                undo_btn=None,
+            )
+
+        gr.Markdown(
+            """
+            ### 사용 팁
+            - 모델 없으면 먼저: `ollama pull deepseek-r1`
+            - 답변이 짧으면 **최대 생성 토큰**을 올리세요.
+            - 너무 산만하면 **온도**를 낮춰보세요(예: 0.2~0.5).
+            """
+        )
+    return demo
+
+
+# ==============================
+# 스크립트 실행
+# ==============================
+if __name__ == "__main__":
+    """
+    🔄 원본(OpenAI) 대비 맵핑
+    - openai.OpenAI(api_key=...)                      ->  불필요(로컬 실행)
+    - client.chat.completions.create(model="gpt-4o")  ->  ollama.chat(model="deepseek-r1", ...)
+    - messages(user="AI에 대한 시...")                 ->  동일 의미의 prompt 전달
+    - completion.choices[0].message.content           ->  함수 반환 문자열(think 제거)
+    """
+    # 간단 CLI 테스트(원하면 주석 해제)
+    # print(local_chat_complete("AI에 대한 시를 하나 작성해줘"))
+
+    # Gradio 실행
+    app = build_app()
+    app.launch(server_name="0.0.0.0", server_port=7860, show_error=True)
+
+

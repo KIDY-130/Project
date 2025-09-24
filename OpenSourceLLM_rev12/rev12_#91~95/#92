@@ -1,0 +1,327 @@
+#92
+"""
+OpenCode 변환본: OpenAI Images API → Diffusers(Stable Diffusion XL) + Gradio (로컬)
+-----------------------------------------------------------------------
+이 스크립트는 OpenAI의 client.images.generate / edit / variations 예제를
+**완전 로컬 파이프라인**으로 대체합니다.
+- Text→Image: StableDiffusionXLPipeline
+- Image→Image(스타일 변환): StableDiffusionXLImg2ImgPipeline
+- Inpaint(마스크 편집): StableDiffusionXLInpaintPipeline
+- (선택) Ollama + deepseek-r1로 프롬프트 폴리시(고도화)
+- Gradio GUI + 배치 생성, 시드 고정, 해상도/스텝/CFG 조절
+
+설치 안내
+  pip install -U diffusers transformers accelerate safetensors torch torchvision --index-url https://download.pytorch.org/whl/cu121
+  pip install -U gradio pillow numpy
+  # (선택) 더 빠르게: xformers
+  pip install -U xformers --index-url https://download.pytorch.org/whl/cu121
+
+모델 준비(최초 1회 자동 다운로드)
+  - base:     stabilityai/stable-diffusion-xl-base-1.0
+  - refiner:  stabilityai/stable-diffusion-xl-refiner-1.0 (선택)
+
+실행
+  python imggen_diffusers_gradio.py
+
+폴더
+  - outputs/ 에 생성 이미지 자동 저장
+"""
+from __future__ import annotations
+import os, time, math, random
+from typing import List, Tuple, Optional
+from dataclasses import dataclass
+
+import torch
+from PIL import Image
+import numpy as np
+import gradio as gr
+
+from diffusers import (
+    StableDiffusionXLPipeline,
+    StableDiffusionXLImg2ImgPipeline,
+    StableDiffusionXLInpaintPipeline,
+)
+
+# ===============================
+# 환경설정
+# ===============================
+MODEL_BASE = os.environ.get("SDXL_BASE", "stabilityai/stable-diffusion-xl-base-1.0")
+MODEL_REFINER = os.environ.get("SDXL_REFINER", "stabilityai/stable-diffusion-xl-refiner-1.0")
+USE_REFINER = os.environ.get("USE_REFINER", "0") == "1"  # 성능 여유 있을 때만
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.float16 if (DEVICE == "cuda") else torch.float32
+OUT_DIR = os.path.abspath("outputs")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# (선택) Ollama로 프롬프트 폴리시
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "deepseek-r1:7b")
+
+# ===============================
+# 모델 로드 (지연 로드)
+# ===============================
+@dataclass
+class Pipelines:
+    txt2img: Optional[StableDiffusionXLPipeline] = None
+    img2img: Optional[StableDiffusionXLImg2ImgPipeline] = None
+    inpaint: Optional[StableDiffusionXLInpaintPipeline] = None
+
+
+PIPES = Pipelines()
+
+
+def _common_opt(pipe):
+    pipe.to(DEVICE, dtype=DTYPE)
+    pipe.safety_checker = None  # 필요 시 자체 필터 적용
+    pipe.enable_attention_slicing()
+    if DEVICE == "cuda":
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+        except Exception:
+            pass
+    return pipe
+
+
+def get_txt2img():
+    if PIPES.txt2img is None:
+        PIPES.txt2img = _common_opt(StableDiffusionXLPipeline.from_pretrained(MODEL_BASE, use_safetensors=True))
+    return PIPES.txt2img
+
+
+def get_img2img():
+    if PIPES.img2img is None:
+        PIPES.img2img = _common_opt(StableDiffusionXLImg2ImgPipeline.from_pretrained(MODEL_BASE, use_safetensors=True))
+    return PIPES.img2img
+
+
+def get_inpaint():
+    if PIPES.inpaint is None:
+        PIPES.inpaint = _common_opt(StableDiffusionXLInpaintPipeline.from_pretrained(MODEL_BASE, use_safetensors=True))
+    return PIPES.inpaint
+
+# (선택) Refiner 호출
+
+def run_refiner(images: List[Image.Image], steps: int = 20, cfg: float = 7.0) -> List[Image.Image]:
+    if not USE_REFINER:
+        return images
+    ref = _common_opt(StableDiffusionXLPipeline.from_pretrained(MODEL_REFINER, use_safetensors=True))
+    refined = []
+    for im in images:
+        out = ref(prompt="highly detailed, photo quality", image=im, num_inference_steps=steps, guidance_scale=cfg)
+        refined.append(out.images[0])
+    del ref
+    return refined
+
+# ===============================
+# 프롬프트 폴리시 (Ollama, 선택)
+# ===============================
+import requests
+
+def polish_prompt(prompt: str, negative: str = "") -> str:
+    """Ollama(DeepSeek-R1)로 간단 프롬프트 고도화. 네트워크 실패 시 원문 반환"""
+    try:
+        sys = (
+            "You are a prompt engineer. Improve the user's prompt for Stable Diffusion XL. "
+            "Keep the original content and add helpful style/lighting/lens details in English. "
+            "Return a single line under 120 words."
+        )
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": sys},
+                {"role": "user", "content": f"Prompt: {prompt}\nNegative: {negative}"},
+            ],
+            "stream": False,
+            "options": {"temperature": 0.2},
+        }
+        r = requests.post(f"{OLLAMA_HOST.rstrip('/')}/api/chat", json=payload, timeout=30)
+        r.raise_for_status()
+        txt = r.json().get("message", {}).get("content", "").strip()
+        # DeepSeek-R1은 <think>를 포함할 수 있음 → 제거
+        import re
+        txt = re.sub(r"<think>.*?</think>", "", txt, flags=re.DOTALL).strip()
+        return txt or prompt
+    except Exception:
+        return prompt
+
+# ===============================
+# 공통 도우미
+# ===============================
+
+def parse_size(size_label: str) -> Tuple[int, int]:
+    # "512x512" → (512, 512)
+    try:
+        w, h = size_label.lower().split("x")
+        return int(w), int(h)
+    except Exception:
+        return 1024, 1024  # SDXL 기본 해상도
+
+
+def save_images(imgs: List[Image.Image], prefix: str) -> List[str]:
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    paths = []
+    for i, im in enumerate(imgs):
+        path = os.path.join(OUT_DIR, f"{prefix}_{ts}_{i:02d}.png")
+        im.save(path)
+        paths.append(path)
+    return paths
+
+# ===============================
+# 생성 함수: Text→Image
+# ===============================
+
+def generate_text2img(prompt: str, negative: str, size: str, steps: int, cfg: float, n: int, seed: int, use_ollama: bool):
+    if not prompt.strip():
+        raise gr.Error("프롬프트를 입력하세요.")
+    w, h = parse_size(size)
+    if use_ollama:
+        prompt = polish_prompt(prompt, negative)
+    pipe = get_txt2img()
+    g = torch.Generator(device=DEVICE).manual_seed(seed) if seed >= 0 else None
+    out = pipe(
+        prompt=prompt,
+        negative_prompt=(negative or None),
+        width=w, height=h,
+        num_inference_steps=steps,
+        guidance_scale=cfg,
+        num_images_per_prompt=n,
+        generator=g,
+    )
+    imgs = out.images
+    imgs = run_refiner(imgs)
+    paths = save_images(imgs, prefix="txt2img")
+    return imgs, "\n".join(paths)
+
+# ===============================
+# 생성 함수: Image→Image (Variations 스타일)
+# ===============================
+
+def generate_img2img(init_img: Image.Image, prompt: str, strength: float, negative: str, steps: int, cfg: float, n: int, seed: int, use_ollama: bool):
+    if init_img is None:
+        raise gr.Error("원본 이미지를 업로드하세요.")
+    if use_ollama and prompt.strip():
+        prompt = polish_prompt(prompt, negative)
+    pipe = get_img2img()
+    g = torch.Generator(device=DEVICE).manual_seed(seed) if seed >= 0 else None
+    out = pipe(
+        prompt=(prompt or ""),
+        image=init_img,
+        strength=float(strength),  # 0.0~1.0, 0에 가까울수록 원본 보존
+        negative_prompt=(negative or None),
+        guidance_scale=cfg,
+        num_inference_steps=steps,
+        num_images_per_prompt=n,
+        generator=g,
+    )
+    imgs = out.images
+    imgs = run_refiner(imgs)
+    paths = save_images(imgs, prefix="img2img")
+    return imgs, "\n".join(paths)
+
+# ===============================
+# 생성 함수: Inpaint (Edit)
+# ===============================
+
+def generate_inpaint(init_img: Image.Image, mask_img: Image.Image, prompt: str, negative: str, steps: int, cfg: float, n: int, seed: int, use_ollama: bool):
+    if init_img is None or mask_img is None:
+        raise gr.Error("원본/마스크 이미지를 모두 업로드하세요.")
+    # SDXL Inpaint는 흰색(255) 부분을 수정 대상으로 사용합니다.
+    if use_ollama and prompt.strip():
+        prompt = polish_prompt(prompt, negative)
+    pipe = get_inpaint()
+    g = torch.Generator(device=DEVICE).manual_seed(seed) if seed >= 0 else None
+    out = pipe(
+        prompt=(prompt or ""),
+        image=init_img,
+        mask_image=mask_img,
+        negative_prompt=(negative or None),
+        guidance_scale=cfg,
+        num_inference_steps=steps,
+        num_images_per_prompt=n,
+        generator=g,
+    )
+    imgs = out.images
+    imgs = run_refiner(imgs)
+    paths = save_images(imgs, prefix="inpaint")
+    return imgs, "\n".join(paths)
+
+# ===============================
+# Gradio UI
+# ===============================
+size_choices = ["512x512", "768x768", "1024x1024", "1152x896", "896x1152"]
+
+with gr.Blocks(title="Stable Diffusion XL — OpenCode", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("""
+    # 🖌️ Stable Diffusion XL (로컬) — OpenCode
+    OpenAI Images API 없이 **완전 로컬**로 텍스트생성/이미지편집/변형을 제공합니다.
+    """)
+
+    with gr.Tabs():
+        with gr.TabItem("Text → Image"):
+            t_prompt = gr.Textbox(label="Prompt", value="A beautiful landscape, golden hour, ultrarealistic")
+            t_negative = gr.Textbox(label="Negative Prompt", value="low quality, blurry, distorted")
+            with gr.Row():
+                t_size = gr.Dropdown(size_choices, value="1024x1024", label="Size")
+                t_steps = gr.Slider(10, 80, value=30, step=1, label="Steps")
+                t_cfg = gr.Slider(1.0, 12.0, value=7.0, step=0.5, label="CFG")
+            with gr.Row():
+                t_n = gr.Slider(1, 6, value=1, step=1, label="Batch (n)")
+                t_seed = gr.Number(value=-1, label="Seed(-1=random)")
+                t_polish = gr.Checkbox(value=False, label="Ollama로 프롬프트 고도화")
+            t_btn = gr.Button("Generate", variant="primary")
+            t_gallery = gr.Gallery(label="Results", columns=3, height=512)
+            t_paths = gr.Textbox(label="Saved Files")
+            t_btn.click(generate_text2img, inputs=[t_prompt, t_negative, t_size, t_steps, t_cfg, t_n, t_seed, t_polish], outputs=[t_gallery, t_paths])
+
+        with gr.TabItem("Image → Image (Variations)"):
+            i_img = gr.Image(label="Init Image", type="pil")
+            i_prompt = gr.Textbox(label="Prompt (선택)", value="")
+            i_strength = gr.Slider(0.05, 1.0, value=0.35, step=0.05, label="Denoise Strength")
+            i_negative = gr.Textbox(label="Negative Prompt", value="low quality, blurry, distorted")
+            with gr.Row():
+                i_steps = gr.Slider(10, 80, value=30, step=1, label="Steps")
+                i_cfg = gr.Slider(1.0, 12.0, value=7.0, step=0.5, label="CFG")
+            with gr.Row():
+                i_n = gr.Slider(1, 6, value=2, step=1, label="Batch (n)")
+                i_seed = gr.Number(value=-1, label="Seed(-1=random)")
+                i_polish = gr.Checkbox(value=False, label="Ollama 프롬프트")
+            i_btn = gr.Button("Generate", variant="primary")
+            i_gallery = gr.Gallery(label="Results", columns=3, height=512)
+            i_paths = gr.Textbox(label="Saved Files")
+            i_btn.click(generate_img2img, inputs=[i_img, i_prompt, i_strength, i_negative, i_steps, i_cfg, i_n, i_seed, i_polish], outputs=[i_gallery, i_paths])
+
+        with gr.TabItem("Inpaint (Edit)"):
+            p_img = gr.Image(label="Init Image", type="pil")
+            p_mask = gr.Image(label="Mask (흰색=수정)" , type="pil")
+            p_prompt = gr.Textbox(label="Prompt", value="A group of people hiking in green forest between trees")
+            p_negative = gr.Textbox(label="Negative Prompt", value="low quality, artifacts")
+            with gr.Row():
+                p_steps = gr.Slider(10, 80, value=30, step=1, label="Steps")
+                p_cfg = gr.Slider(1.0, 12.0, value=7.0, step=0.5, label="CFG")
+            with gr.Row():
+                p_n = gr.Slider(1, 4, value=1, step=1, label="Batch (n)")
+                p_seed = gr.Number(value=-1, label="Seed(-1=random)")
+                p_polish = gr.Checkbox(value=False, label="Ollama 프롬프트")
+            p_btn = gr.Button("Generate", variant="primary")
+            p_gallery = gr.Gallery(label="Results", columns=3, height=512)
+            p_paths = gr.Textbox(label="Saved Files")
+            p_btn.click(generate_inpaint, inputs=[p_img, p_mask, p_prompt, p_negative, p_steps, p_cfg, p_n, p_seed, p_polish], outputs=[p_gallery, p_paths])
+
+    gr.Markdown("""
+    ### 사용 팁
+    - **Variations**는 Image→Image 탭에서 `strength≈0.2~0.4`로 원본 느낌을 유지하며 변주합니다.
+    - **Inpaint**는 마스크 이미지에서 **흰색(255)** 부분이 수정 대상입니다. (검정=보존)
+    - VRAM이 부족하면 해상도를 낮추거나 Steps를 줄이세요.
+    - 재현 가능한 결과를 원하면 **Seed**를 0 이상의 정수로 고정하세요.
+    - Refiner를 쓰려면 `USE_REFINER=1` 환경변수를 설정하세요.
+    """)
+
+if __name__ == "__main__":
+    demo.launch()
+
+
+# pip install -U diffusers transformers accelerate safetensors torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# pip install -U gradio pillow numpy
+# (선택) 속도 ↑
+# pip install -U xformers --index-url https://download.pytorch.org/whl/cu121

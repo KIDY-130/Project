@@ -1,0 +1,211 @@
+#83
+"""
+LlamaIndex + Gemini 예제 ➜ 오픈소스 로컬 스택으로 변환
+- LLM: **Ollama 로컬 서버의 DeepSeek-R1** (예: `ollama pull deepseek-r1`)
+- Embedding: **HuggingFace BAAI/bge-m3** (로컬 가중치 자동 캐시)
+- Vector Index: **LlamaIndex VectorStoreIndex** (디스크 영속화 포함)
+- GUI: **Gradio** (문서 업로드/인덱싱/질의/저장·불러오기)
+
+※ 외부 API 키 불필요. 모든 추론/임베딩이 로컬에서 동작합니다.
+작성: OpenCode
+"""
+
+# =====================
+# 필요한 패키지 설치(최초 1회)
+# =====================
+# pip install llama-index==0.11.20 llama-index-llms-ollama llama-index-embeddings-huggingface gradio
+
+import os
+import shutil
+import tempfile
+import logging
+from pathlib import Path
+from typing import List
+
+import gradio as gr
+
+from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex, StorageContext, load_index_from_storage
+from llama_index.llms.ollama import Ollama
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
+# ---------------------
+# 로깅 설정 (디버깅용)
+# ---------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("OpenCode-LlamaIndex")
+
+# =====================
+# 0) 로컬 모델 준비 가이드 (주석)
+# =====================
+# 터미널에서 미리 아래를 실행하세요:
+#   ollama pull deepseek-r1
+# Ollama 기본 엔드포인트는 http://localhost:11434 입니다.
+
+# =====================
+# 1) LlamaIndex 전역 설정: 로컬 LLM + 임베딩
+# =====================
+OLLAMA_MODEL = os.environ.get("OC_LLM_MODEL", "deepseek-r1")
+EMBED_MODEL = os.environ.get("OC_EMBED_MODEL", "BAAI/bge-m3")
+PERSIST_DIR = os.environ.get("OC_PERSIST_DIR", "./storage")
+DATA_DIR = os.environ.get("OC_DATA_DIR", "./data")
+
+# LLM: Ollama(DeepSeek-R1)
+Settings.llm = Ollama(
+    model=OLLAMA_MODEL,
+    request_timeout=60.0,
+    # 옵션: temperature, num_ctx, mirostat 등 필요 시 추가
+)
+
+# Embedding: BGE-M3 (HuggingFace)
+Settings.embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL)
+
+# =====================
+# 2) 문서 로딩 유틸
+# =====================
+
+def ensure_dir(path: str | Path):
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+
+def save_uploaded_files(files: List[gr.File], target_dir: str) -> List[str]:
+    """Gradio로 업로드된 파일들을 target_dir에 저장하고 경로 리스트를 반환."""
+    ensure_dir(target_dir)
+    saved = []
+    for f in files or []:
+        src = Path(f.name)
+        dst = Path(target_dir) / src.name
+        shutil.copy2(src, dst)
+        saved.append(str(dst))
+    return saved
+
+
+def load_documents_from_dir(directory: str):
+    """data 폴더에서 지원 포맷 파일들을 읽어 LlamaIndex Document 리스트를 반환"""
+    ensure_dir(directory)
+    reader = SimpleDirectoryReader(directory)
+    docs = reader.load_data()
+    return docs
+
+# =====================
+# 3) 인덱스 생성/쿼리/저장/불러오기
+# =====================
+
+def build_index_from_dir(data_dir: str, persist_dir: str = PERSIST_DIR) -> str:
+    """data_dir의 문서로 벡터 인덱스를 만들고 persist_dir에 저장."""
+    docs = load_documents_from_dir(data_dir)
+    if not docs:
+        return "❌ 문서를 찾지 못했습니다. 먼저 파일을 업로드/배치하세요."
+    index = VectorStoreIndex.from_documents(docs)
+    index.storage_context.persist(persist_dir)
+    return f"✅ 인덱스 생성 및 저장 완료 • 문서 수: {len(docs)} • 경로: {persist_dir}"
+
+
+def load_index(persist_dir: str = PERSIST_DIR):
+    if not Path(persist_dir).exists():
+        raise FileNotFoundError("저장된 인덱스가 없습니다. 먼저 인덱스를 생성/저장하세요.")
+    storage_context = StorageContext.from_defaults(persist_dir=persist_dir)
+    index = load_index_from_storage(storage_context)
+    return index
+
+
+def query_index(query: str, top_k: int = 3, persist_dir: str = PERSIST_DIR) -> str:
+    index = load_index(persist_dir)
+    engine = index.as_query_engine(similarity_top_k=top_k)
+    resp = engine.query(query)
+    return str(resp)
+
+# =====================
+# 4) 빠른 테스트 스크립트 (원문의 3개 질문 대응)
+# =====================
+TEST_QUERIES = [
+    "은비의 나이는?",
+    "은비가 은신처에서 만난 인물은?",
+    "은비와 용병이 쫓기는 이유는?",
+]
+
+# =====================
+# 5) Gradio UI
+# =====================
+with gr.Blocks(title="OpenCode • 로컬 LlamaIndex (Ollama + BGE-M3)", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("""
+    # 📚 OpenCode • 로컬 LlamaIndex (Ollama + DeepSeek-R1)
+    - **문서 업로드 → 인덱스 생성/저장 → 질의응답 → 인덱스 재로드**
+    - LLM: DeepSeek-R1 (Ollama) / Embedding: BGE-M3 (HuggingFace)
+    - 100% 로컬, API 키 불필요
+    """)
+
+    with gr.Tabs():
+        # ---------- 탭 1: Build Index
+        with gr.Tab("Build Index"):
+            gr.Markdown("문서를 업로드하거나 data 폴더에 넣은 뒤 인덱스를 생성하세요.")
+            uploads = gr.Files(label="문서 업로드 (pdf, txt, md, docx 등)")
+            data_dir_tb = gr.Textbox(value=DATA_DIR, label="데이터 폴더 경로")
+            persist_tb = gr.Textbox(value=PERSIST_DIR, label="저장 폴더 경로")
+            save_btn = gr.Button("업로드 저장")
+            build_btn = gr.Button("인덱스 생성/저장", variant="primary")
+            status_build = gr.Markdown("상태: 대기 중")
+
+            def do_save(files, tgt):
+                saved = save_uploaded_files(files, tgt)
+                return f"저장된 파일 수: {len(saved)}\n" + "\n".join(saved)
+
+            def do_build(ddir, pdir):
+                try:
+                    msg = build_index_from_dir(ddir, pdir)
+                    return msg
+                except Exception as e:
+                    return f"❌ 오류: {e}"
+
+            save_btn.click(do_save, [uploads, data_dir_tb], status_build)
+            build_btn.click(do_build, [data_dir_tb, persist_tb], status_build)
+
+        # ---------- 탭 2: Query
+        with gr.Tab("Query"):
+            persist_q = gr.Textbox(value=PERSIST_DIR, label="불러올 저장 폴더 경로")
+            topk = gr.Slider(1, 10, value=3, step=1, label="similarity_top_k")
+            qbox = gr.Textbox(value=TEST_QUERIES[0], label="질문", lines=2)
+            ask_btn = gr.Button("질의", variant="primary")
+            ans_md = gr.Markdown()
+
+            def do_query(pdir, k, q):
+                try:
+                    ans = query_index(q, int(k), pdir)
+                    return ans
+                except Exception as e:
+                    return f"❌ 오류: {e}"
+
+            ask_btn.click(do_query, [persist_q, topk, qbox], ans_md)
+
+        # ---------- 탭 3: Quick Demo
+        with gr.Tab("Quick Demo"):
+            gr.Markdown("원문 예제의 3개 질문을 연속으로 실행해봅니다.")
+            persist_d = gr.Textbox(value=PERSIST_DIR, label="저장 폴더 경로")
+            run_demo = gr.Button("실행")
+            demo_out = gr.Markdown()
+
+            def do_demo(pdir):
+                try:
+                    outs = []
+                    for q in TEST_QUERIES:
+                        outs.append(f"**Q:** {q}\n**A:** {query_index(q, 3, pdir)}\n")
+                    return "\n---\n".join(outs)
+                except Exception as e:
+                    return f"❌ 오류: {e}"
+
+            run_demo.click(do_demo, [persist_d], demo_out)
+
+    gr.Markdown("""
+    ---
+    ### 사용 팁
+    - `data/` 폴더를 그대로 사용하거나 파일 업로드 후 "업로드 저장"을 누르세요.
+    - "인덱스 생성/저장" 후에는 Query 탭에서 질문할 수 있습니다.
+    - 인덱스는 `./storage`(기본값)에 저장되며, 나중에 `load_index_from_storage`로 재사용합니다.
+    - 임베딩 모델은 멀티링구얼(BGE-M3)이므로 한국어/영어 섞인 문서에도 잘 동작합니다.
+    - LLM 응답 길이나 스타일은 Ollama 모델 옵션으로 조정할 수 있습니다.
+    """)
+
+if __name__ == "__main__":
+    # Gradio 앱 실행
+    demo.launch(server_name="0.0.0.0", server_port=7865, share=False)
+
+

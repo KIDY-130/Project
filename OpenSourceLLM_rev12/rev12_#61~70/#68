@@ -1,0 +1,350 @@
+#68
+import os
+import re
+import base64
+from typing import List, Dict, Any
+
+# GUI: Gradio
+import gradio as gr
+
+# 데이터/이미지
+from datasets import load_dataset
+from PIL import Image
+
+# 벡터DB: Chroma + OpenCLIP 임베딩 (로컬)
+import chromadb
+from chromadb.utils.embedding_functions import OpenCLIPEmbeddingFunction
+from chromadb.utils.data_loaders import ImageLoader
+
+# 이미지 캡셔닝(오픈소스): BLIP (transformers)
+# - 시각 모델이 없는 DeepSeek-R1 보완용: 이미지 → 텍스트 캡션 생성 후 R1에 전달
+# - 최초 실행 시 모델이 자동 다운로드됩니다.
+from transformers import BlipProcessor, BlipForConditionalGeneration
+import torch
+
+# HTTP 클라이언트: Ollama 로컬 API 호출 (http://localhost:11434)
+import requests
+
+############################################################
+# 환경 설정
+############################################################
+# 로컬 PC에 Ollama 및 deepseek-r1 모델이 설치되어 있다고 가정합니다.
+# 모델 이름은 환경변수 OLLAMA_MODEL 로 바꿀 수 있습니다.
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:latest")  # 예: deepseek-r1:7b, deepseek-r1:32b 등
+
+# 스크립트 경로
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 데이터/저장 경로
+DATASET_NAME = "detection-datasets/fashionpedia"
+DATASET_DIR = os.path.join(SCRIPT_DIR, "fashion_dataset")
+VDB_DIR = os.path.join(SCRIPT_DIR, "img_vdb")
+
+# 저장할 이미지 개수(너무 크게 잡으면 최초 세팅 시간이 오래 걸립니다)
+NUM_IMAGES_TO_SAVE = int(os.getenv("NUM_IMAGES", "300"))
+
+############################################################
+# Ollama Chat Helper (DeepSeek-R1)
+############################################################
+
+def ollama_chat(messages: List[Dict[str, str]], model: str = OLLAMA_MODEL, **options) -> str:
+    """
+    Ollama Chat API로 로컬 LLM(DeepSeek-R1)을 호출합니다.
+    messages: [{"role": "system|user|assistant", "content": "..."}, ...]
+    options: 템퍼러처 등 옵션. 예) temperature=0.2
+    반환: 모델의 텍스트 응답(str)
+    """
+    url = f"{OLLAMA_URL}/api/chat"
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": options or {"temperature": 0.2},
+    }
+    resp = requests.post(url, json=payload, timeout=600)
+    resp.raise_for_status()
+    data = resp.json()
+    text = data.get("message", {}).get("content", "")
+    # DeepSeek-R1은 <think> 내부 사고 흔적을 내보낼 수 있습니다. UI 노이즈 제거용으로 숨깁니다.
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.MULTILINE)
+    return text.strip()
+
+############################################################
+# 번역 유틸(DeepSeek-R1 사용) — 폐쇄형 API 제거
+############################################################
+
+def translate(text: str, target_lang: str) -> str:
+    """DeepSeek-R1을 사용한 간단 번역기."""
+    sys = {
+        "role": "system",
+        "content": (
+            "You are a professional translator. Translate the user's text faithfully, "
+            "preserving meaning and tone. Output only the translation without comments."
+        ),
+    }
+    usr = {"role": "user", "content": f"Translate to {target_lang}:\n{text}"}
+    return ollama_chat([sys, usr], temperature=0.0)
+
+############################################################
+# 데이터셋 준비 (FashionPedia)
+############################################################
+
+def setup_dataset():
+    """패션 관련 공개 데이터셋(FashionPedia) 다운로드 및 폴더 준비."""
+    dataset = load_dataset(DATASET_NAME)
+    os.makedirs(DATASET_DIR, exist_ok=True)
+    return dataset, DATASET_DIR
+
+
+def save_images(dataset, dataset_folder: str, num_images: int = NUM_IMAGES_TO_SAVE):
+    """데이터셋에서 지정 개수만큼 이미지를 PNG로 저장."""
+    count = min(num_images, len(dataset["train"]))
+    for i in range(count):
+        image = dataset["train"][i]["image"]  # PIL Image
+        out_path = os.path.join(dataset_folder, f"image_{i+1}.png")
+        image.save(out_path)
+    print(f"{count}개의 이미지를 {dataset_folder}에 저장했습니다.")
+
+############################################################
+# Chroma 벡터DB 준비 (이미지 임베딩/검색)
+############################################################
+
+def setup_chroma_db():
+    os.makedirs(VDB_DIR, exist_ok=True)
+    chroma_client = chromadb.PersistentClient(path=VDB_DIR)
+    image_loader = ImageLoader()
+    clip = OpenCLIPEmbeddingFunction()  # 로컬 OpenCLIP 사용
+    image_vdb = chroma_client.get_or_create_collection(
+        name="image", embedding_function=clip, data_loader=image_loader
+    )
+    return image_vdb
+
+
+def get_existing_ids(image_vdb, dataset_folder: str):
+    existing_ids = set()
+    try:
+        # vdb에 들어있는 모든 id를 최대한 가져오되, 파일 개수 만큼만 요청
+        num_images = len([n for n in os.listdir(dataset_folder) if n.endswith('.png')])
+        records = image_vdb.query(query_texts=[""], n_results=num_images, include=["ids"])
+        for record in records.get("ids", []):
+            for _id in record:
+                existing_ids.add(_id)
+        print(f"벡터DB에 존재하는 ID 수: {len(existing_ids)}")
+    except Exception as e:
+        print(f"기존 ID 조회 중 예외가 발생했지만 계속 진행합니다: {e}")
+    return existing_ids
+
+
+def add_images_to_db(image_vdb, dataset_folder: str):
+    existing_ids = get_existing_ids(image_vdb, dataset_folder)
+    ids, uris = [], []
+    for i, filename in enumerate(sorted(os.listdir(dataset_folder))):
+        if not filename.endswith('.png'):
+            continue
+        img_id = str(i)
+        if img_id not in existing_ids:
+            file_path = os.path.join(dataset_folder, filename)
+            ids.append(img_id)
+            uris.append(file_path)
+    if ids:
+        image_vdb.add(ids=ids, uris=uris)
+        print(f"새로운 {len(ids)}개 이미지를 벡터DB에 추가했습니다.")
+    else:
+        print("추가할 새로운 이미지가 없습니다.")
+
+
+def query_db(image_vdb, query: str, results: int = 2):
+    return image_vdb.query(
+        query_texts=[query],
+        n_results=results,
+        include=["uris", "distances", "ids"],
+    )
+
+############################################################
+# 이미지 캡셔닝(BLIP) — 시각 정보 → 텍스트로 변환
+############################################################
+
+_BLIP_PROCESSOR = None
+_BLIP_MODEL = None
+
+def _load_blip():
+    global _BLIP_PROCESSOR, _BLIP_MODEL
+    if _BLIP_PROCESSOR is None or _BLIP_MODEL is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _BLIP_PROCESSOR = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
+        _BLIP_MODEL = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large").to(device)
+    return _BLIP_PROCESSOR, _BLIP_MODEL
+
+
+def caption_image(image_path: str) -> str:
+    """이미지 1장을 BLIP으로 캡션 생성."""
+    processor, model = _load_blip()
+    device = next(model.parameters()).device
+    image = Image.open(image_path).convert("RGB")
+    inputs = processor(images=image, return_tensors="pt").to(device)
+    with torch.no_grad():
+        out = model.generate(**inputs, max_new_tokens=40)
+    caption = processor.decode(out[0], skip_special_tokens=True)
+    return caption
+
+############################################################
+# 패션 조언 프롬프팅 (DeepSeek-R1)
+############################################################
+
+def fashion_advice_with_captions(user_query_ko: str, image_paths: List[str]) -> str:
+    """
+    사용자 한국어 질문과, 관련 이미지들의 BLIP 캡션을 DeepSeek-R1에 전달하여
+    스타일링 조언(한국어)을 생성합니다.
+    """
+    # 이미지들 텍스트화
+    captions = []
+    for p in image_paths:
+        try:
+            captions.append({"path": p, "caption": caption_image(p)})
+        except Exception as e:
+            captions.append({"path": p, "caption": f"(캡션 생성 실패: {e})"})
+
+    # 시스템/유저 프롬프트 구성
+    sys = {
+        "role": "system",
+        "content": (
+            "You are a helpful fashion & styling assistant. Use the provided image captions "
+            "as visual context. Give concise, conversational advice in Korean, and refer to "
+            "specific described elements (colors, garments, textures) where helpful. Use Markdown for emphasis."
+        ),
+    }
+
+    # 간단한 포맷으로 이미지 캡션을 텍스트 컨텍스트로 제공
+    caption_block = "\n".join([
+        f"- Image {i+1} ({os.path.basename(c['path'])}): {c['caption']}" for i, c in enumerate(captions)
+    ])
+
+    user = {
+        "role": "user",
+        "content": (
+            f"질문: {user_query_ko}\n\n"
+            f"아래는 관련 이미지의 자동 캡션입니다. 이 설명을 시각 단서로 활용해서 답변하세요:\n{caption_block}\n\n"
+            f"요청사항:\n"
+            f"1) 핵심 아이디어 3~6개\n"
+            f"2) 이유/근거를 간단히\n"
+            f"3) 상황/계절/예산에 따른 변형 팁이 있으면 추가\n"
+        ),
+    }
+
+    answer = ollama_chat([sys, user], temperature=0.3)
+    return answer
+
+############################################################
+# 유틸: 이미지 Base64 (Gradio Gallery엔 필요 없음, 참고용)
+############################################################
+
+def load_image_as_base64(image_path: str) -> str:
+    with open(image_path, "rb") as img_file:
+        return base64.b64encode(img_file.read()).decode("utf-8")
+
+############################################################
+# 파이프라인 (Gradio에서 호출)
+############################################################
+
+def pipeline(user_query_ko: str):
+    """Gradio 이벤트 핸들러: 한국어 질문 입력 → 검색 → 캡션 → DeepSeek-R1 조언."""
+    if not user_query_ko or not user_query_ko.strip():
+        return (
+            gr.update(value="질문을 입력하세요."),  # 응답 텍스트
+            [],  # 이미지 갤러리
+        )
+
+    # 1) 데이터/DB 준비(최초 1회성 작업은 앱 시작 시 완료되도록 main에서 처리)
+    image_vdb = setup_chroma_db()
+
+    # 2) 영어로 변환(검색 성능 보완; OpenCLIP는 영어 쿼리에 강함)
+    try:
+        query_en = translate(user_query_ko, "English")
+    except Exception:
+        # 번역 실패 시 한국어 그대로 사용 (강건성)
+        query_en = user_query_ko
+
+    # 3) 유사 이미지 검색
+    results = query_db(image_vdb, query_en, results=2)
+    uris = results.get("uris", [[]])[0]
+
+    # 4) 패션 조언 생성(이미지 캡션 → DeepSeek-R1)
+    advice = fashion_advice_with_captions(user_query_ko, uris)
+
+    # 5) Gradio용 갤러리 데이터: [(image_path, caption), ...] 형식도 가능하나 여기선 경로만
+    gallery_items = [(u, os.path.basename(u)) for u in uris]
+
+    return advice, gallery_items
+
+############################################################
+# 초기 세팅(앱 시작 시 1회)
+############################################################
+
+def initial_setup():
+    # 데이터셋/이미지 준비
+    if not os.path.exists(DATASET_DIR) or not any(f.endswith('.png') for f in os.listdir(DATASET_DIR)):
+        dataset, _ = setup_dataset()
+        save_images(dataset, DATASET_DIR, NUM_IMAGES_TO_SAVE)
+    else:
+        print("데이터셋 이미지가 이미 준비되어 있습니다.")
+
+    # 벡터DB 구축
+    image_vdb = setup_chroma_db()
+    if not os.path.exists(VDB_DIR) or not os.listdir(VDB_DIR):
+        # 폴더가 비어있으면 추가
+        add_images_to_db(image_vdb, DATASET_DIR)
+    else:
+        # 기존 DB가 있어도 새 이미지가 있으면 추가
+        add_images_to_db(image_vdb, DATASET_DIR)
+
+############################################################
+# Gradio UI
+############################################################
+
+def build_ui():
+    with gr.Blocks(theme=gr.themes.Soft()) as demo:
+        gr.Markdown("""
+        # 👗 **FashionRAG (오픈소스/로컬 전환본)**
+        - **LLM**: DeepSeek-R1 (Ollama, 로컬)
+        - **임베딩/검색**: Chroma + OpenCLIP (로컬)
+        - **시각 보완**: BLIP 이미지 캡셔닝(오픈소스)
+        - **UI**: Gradio
+
+        > 로컬 환경만으로 폐쇄형 API 없이 패션 스타일링 조언을 제공합니다.
+        """)
+
+        with gr.Row():
+            q = gr.Textbox(label="스타일링 질문(한국어)", placeholder="예) 하이웨이스트 데님 스커트에 잘 어울리는 상의?", lines=2)
+        with gr.Row():
+            run_btn = gr.Button("검색하고 조언 받기", variant="primary")
+        with gr.Row():
+            out_md = gr.Markdown(label="FashionRAG의 응답")
+        with gr.Row():
+            gallery = gr.Gallery(label="검색된 이미지", show_label=True, columns=2, height=360)
+
+        run_btn.click(fn=pipeline, inputs=[q], outputs=[out_md, gallery])
+
+    return demo
+
+############################################################
+# 엔트리 포인트
+############################################################
+if __name__ == "__main__":
+    # 최초 1회 초기 세팅 (데이터 내려받기/인덱싱)
+    initial_setup()
+    # UI 구동
+    app = build_ui()
+    # share=True 필요 시 외부 접속 공개
+    app.launch(server_name="0.0.0.0", server_port=7860, share=False)
+
+# 필수 패키지
+# pip install gradio datasets pillow chromadb transformers timm torch torchvision # requests
+
+# (선택) GPU 사용 시 PyTorch CUDA 버전 설치 권장
+# conda/venv 환경에서 진행 추천
+
+# Ollama와 모델 준비
+# https://ollama.com/ 설치 후
+# ollama pull deepseek-r1:latest
+# (이미 설치된 모델명이 다르면 코드 상단 OLLAMA_MODEL 환경변수로 지정 가능)

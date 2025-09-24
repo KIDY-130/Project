@@ -1,0 +1,422 @@
+#93
+# app.py
+# ------------------------------------------------------------
+# OpenAI 전용 코드를 로컬 오픈소스 LLM(Ollama + DeepSeek-R1)로 전환한 올인원 예시
+# - 로컬 REST: http://localhost:11434
+# - 채팅/추론: deepseek-r1:7b
+# - 임베딩: nomic-embed-text (또는 설치된 임베딩 모델명으로 교체)
+# - GUI: Gradio 탭 인터페이스
+# ------------------------------------------------------------
+
+import os
+import json
+import time
+import re
+import ast
+import requests
+import numpy as np
+import pandas as pd
+import gradio as gr
+
+# -------------------------------
+# 환경 설정 (필요시 모델명 변경)
+# -------------------------------
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-r1:7b")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")  # 임베딩 전용 모델
+
+# -------------------------------
+# Ollama REST wrapper
+# -------------------------------
+def ollama_generate(model: str, prompt: str, system: str = None, temperature: float = 0.2, max_tokens: int = 512):
+    """
+    DeepSeek-R1 같은 일반 LLM에 대해 텍스트 생성(대화) 요청.
+    - /api/generate 엔드포인트 사용
+    - Ollama는 스트리밍을 기본으로 하므로 stream=False 사용
+    """
+    url = f"{OLLAMA_HOST}/api/generate"
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": temperature,
+            "num_predict": max_tokens
+        }
+    }
+    # system 프롬프트를 모델에 주고싶을 때, prompt 앞쪽에 prepend
+    if system:
+        payload["prompt"] = f"<<SYS>>\n{system}\n<</SYS>>\n\n{prompt}"
+
+    try:
+        resp = requests.post(url, json=payload, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("response", "").strip()
+    except Exception as e:
+        return f"[오류] Ollama generate 실패: {e}"
+
+def ollama_embed(model: str, texts):
+    """
+    임베딩 전용 모델에 대해 /api/embeddings 호출
+    - texts: str 또는 str 리스트
+    - 반환: (N, D) numpy array
+    """
+    url = f"{OLLAMA_HOST}/api/embeddings"
+    # 단일 문자열도 리스트화
+    is_single = isinstance(texts, str)
+    if is_single:
+        texts = [texts]
+
+    vectors = []
+    try:
+        for t in texts:
+            payload = {
+                "model": model,
+                "prompt": t
+            }
+            resp = requests.post(url, json=payload, timeout=120)
+            resp.raise_for_status()
+            emb = resp.json().get("embedding", None)
+            if emb is None:
+                raise RuntimeError("임베딩 응답에 'embedding' 필드 없음")
+            vectors.append(emb)
+        arr = np.array(vectors, dtype=np.float32)
+        return (arr[0] if is_single else arr)
+    except Exception as e:
+        raise RuntimeError(f"[오류] Ollama embeddings 실패: {e}")
+
+# -------------------------------
+# 벡터/전처리 유틸
+# -------------------------------
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    denom = (np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+def preprocess_text_simple(text: str) -> str:
+    """
+    간단 전처리: 소문자화 + 알파벳/한글/숫자/공백만 유지
+    """
+    text = text.lower()
+    text = re.sub(r"[^0-9a-zA-Zㄱ-ㅎ가-힣\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+# -------------------------------
+# 탭 1) 임베딩 데모
+# -------------------------------
+def embed_demo(input_text: str):
+    if not input_text.strip():
+        return "[경고] 입력 텍스트가 비어 있습니다.", ""
+    text = input_text.replace("\n", " ")
+    try:
+        emb = ollama_embed(EMBED_MODEL, text)
+        return "성공: 임베딩 길이 = {}".format(len(emb)), str(list(map(float, emb[:8]))) + " ... (truncated)"
+    except Exception as e:
+        return "실패", str(e)
+
+# -------------------------------
+# 탭 2) 코사인 유사도 (세 가지 방식과 동일 결과)
+# -------------------------------
+def cosine_demo(vec_a_str: str, vec_b_str: str):
+    """
+    입력 예: "2,3,5,2,6,7,9,2,3,4"
+    """
+    try:
+        A = np.array([float(x) for x in vec_a_str.split(",")], dtype=np.float32)
+        B = np.array([float(x) for x in vec_b_str.split(",")], dtype=np.float32)
+        # Numpy
+        cos_np = float(np.dot(A, B) / (np.linalg.norm(A) * np.linalg.norm(B)))
+        # SciPy와 sklearn 없이 동일 수식 (위와 동일)
+        cos_custom = cosine_similarity(A, B)
+        return f"NumPy: {cos_np:.6f}\nCustom(동일식): {cos_custom:.6f}"
+    except Exception as e:
+        return f"[오류] 벡터 파싱/계산 실패: {e}"
+
+# -------------------------------
+# 탭 3) CSV 임베딩 + 검색
+# -------------------------------
+def csv_embed_and_search(csv_file, text_col: str, query: str, topk: int):
+    """
+    csv_file의 text_col을 임베딩 -> embeddings.csv로 저장 -> query와 유사도 TopK 반환
+    """
+    try:
+        if csv_file is None:
+            return "[경고] CSV 파일을 업로드하세요.", None
+        df = pd.read_csv(csv_file.name)
+        if text_col not in df.columns:
+            return f"[오류] '{text_col}' 컬럼이 CSV에 없습니다. 컬럼들: {list(df.columns)}", None
+        # 전처리 + 임베딩
+        texts = [preprocess_text_simple(str(t)) for t in df[text_col].tolist()]
+        embs = []
+        for t in texts:
+            embs.append(ollama_embed(EMBED_MODEL, t))
+        df["embedding"] = [json.dumps(list(map(float, e))) for e in embs]
+
+        # 쿼리 임베딩 및 유사도
+        q = preprocess_text_simple(query) if query else ""
+        if q:
+            q_emb = ollama_embed(EMBED_MODEL, q)
+            sims = []
+            for e in embs:
+                sims.append(cosine_similarity(e, q_emb))
+            df["similarity"] = sims
+            df_sorted = df.sort_values(by="similarity", ascending=False).head(topk).reset_index(drop=True)
+        else:
+            df_sorted = df.head(topk).reset_index(drop=True)
+
+        # 로컬에 저장 (동일 폴더)
+        out_path = os.path.join(os.getcwd(), "embeddings.csv")
+        df.to_csv(out_path, index=False)
+        return f"완료! embeddings.csv 저장 경로: {out_path}", df_sorted
+    except Exception as e:
+        return f"[오류] CSV 처리 실패: {e}", None
+
+# -------------------------------
+# 탭 4) 텍스트 분류 (라벨 임베딩과 코사인 유사도)
+# -------------------------------
+DEFAULT_CATEGORIES = [
+    "U.S. NEWS",
+    "COMEDY",
+    "PARENTING",
+    "WORLD NEWS",
+    "CULTURE & ARTS",
+    "TECH",
+    "SPORTS"
+]
+
+def classify_sentence(sentence: str, categories_text: str):
+    """
+    categories_text: 줄바꿈으로 구분된 카테고리 목록
+    문장을 임베딩하여 각 카테고리 라벨 임베딩과 코사인 유사도 비교
+    """
+    if not sentence.strip():
+        return "[경고] 문장을 입력하세요."
+    cats = [c.strip() for c in categories_text.split("\n") if c.strip()]
+    if not cats:
+        return "[경고] 카테고리를 한 줄에 하나씩 입력하세요."
+
+    s_emb = ollama_embed(EMBED_MODEL, preprocess_text_simple(sentence))
+    best_c, best_sim = None, -1.0
+    details = []
+    for c in cats:
+        c_emb = ollama_embed(EMBED_MODEL, c.lower())
+        sim = cosine_similarity(s_emb, c_emb)
+        details.append((c, sim))
+        if sim > best_sim:
+            best_c, best_sim = c, sim
+    details.sort(key=lambda x: x[1], reverse=True)
+    lines = [f"[Top] {best_c}  (유사도: {best_sim:.4f})", "---- 세부 점수 ----"]
+    lines += [f"{c}: {sim:.4f}" for c, sim in details]
+    return "\n".join(lines)
+
+# -------------------------------
+# 탭 5) “스마트 홈” 채팅 (파인튜닝 대체, 시스템 프롬프트 고정)
+# -------------------------------
+SMART_HOME_SYSTEM = (
+    "당신은 스마트 홈 어시스턴트입니다. 사용자의 요청을 간결하고 정확하게 수행하세요. "
+    "스마트 조명/에어컨/스피커/일정 등 홈 관련 명령을 이해하고 안전하게 답하세요."
+)
+
+def smart_home_chat(history, user_msg, temperature=0.2):
+    """
+    Gradio ChatInterface용 함수
+    history: [(user, bot), ...]
+    user_msg: str
+    """
+    # 간단한 대화 이력 프롬프트 구성 (few-shot 스타일)
+    convo = []
+    for u, b in history:
+        if u:
+            convo.append(f"User: {u}")
+        if b:
+            convo.append(f"Assistant: {b}")
+    convo.append(f"User: {user_msg}\nAssistant:")
+    prompt = "\n".join(convo)
+    reply = ollama_generate(LLM_MODEL, prompt=prompt, system=SMART_HOME_SYSTEM, temperature=float(temperature), max_tokens=512)
+    return reply
+
+# -------------------------------
+# 탭 6) 뉴스 헤드라인 분류 정밀도 평가 (옵션 파일: data/news.json)
+# -------------------------------
+def evaluate_precision(json_path, sample_size=20):
+    """
+    data/news.json (HuffPost 스타일)에서 'headline','category' 필드 사용
+    간단 임베딩-라벨 유사도 분류기로 정밀도 측정 (micro)
+    """
+    try:
+        if json_path is None:
+            return "[경고] data/news.json 파일을 업로드하세요.", ""
+        df = pd.read_json(json_path.name, lines=True)
+        if "headline" not in df.columns or "category" not in df.columns:
+            return "[오류] JSON에 headline/category 필드가 필요합니다.", ""
+        df = df.head(int(sample_size)).copy()
+        cats = sorted(list(set(df["category"].tolist())))
+        # 라벨 임베딩 캐시
+        cat2emb = {c: ollama_embed(EMBED_MODEL, c.lower()) for c in cats}
+
+        y_true, y_pred = [], []
+        wrong, right = [], []
+        for _, row in df.iterrows():
+            sent = preprocess_text_simple(str(row["headline"]))
+            s_emb = ollama_embed(EMBED_MODEL, sent)
+            # 최댓값 선택
+            best_c, best_sim = None, -1.0
+            for c in cats:
+                sim = cosine_similarity(s_emb, cat2emb[c])
+                if sim > best_sim:
+                    best_c, best_sim = c, sim
+            y_true.append(row["category"])
+            y_pred.append(best_c)
+            if best_c == row["category"]:
+                right.append(f"[OK] {row['headline'][:60]} ... -> {best_c}")
+            else:
+                wrong.append(f"[X]  {row['headline'][:60]} ... -> pred={best_c} / gold={row['category']}")
+
+        # micro-precision == accuracy (단일 라벨)
+        acc = float(np.mean([1.0 if a == b else 0.0 for a, b in zip(y_true, y_pred)]))
+        report = "\n".join(wrong[:10] + right[:10])  # 너무 길어질 수 있으니 각 10개만
+        return f"정밀도(=정확도, micro): {acc:.4f}", report
+    except Exception as e:
+        return f"[오류] 평가 실패: {e}", ""
+
+# -------------------------------
+# 탭 7) JSONL 데이터셋 포맷 검증기 (메시지/역할 구조 체크)
+# -------------------------------
+def validate_jsonl(jsonl_file):
+    """
+    OpenAI 튜닝 포맷 유사 규칙을 로컬에서 검증
+    messages: [{role, content, ...}]
+    """
+    try:
+        if jsonl_file is None:
+            return "[경고] JSONL 파일을 업로드하세요."
+        with open(jsonl_file.name, "r", encoding="utf-8") as f:
+            dataset = [json.loads(line) for line in f]
+
+        if len(dataset) < 10:
+            return "오류: 최소 10개 이상 예제가 필요합니다."
+
+        format_errors = {}
+        def inc(k): format_errors[k] = format_errors.get(k, 0) + 1
+
+        for line in dataset:
+            if not isinstance(line, dict):
+                inc("data_type")
+                continue
+            messages = line.get("messages", None)
+            if not messages or not isinstance(messages, list):
+                inc("missing_messages_list")
+                continue
+
+            has_assistant = False
+            for m in messages:
+                if "role" not in m or "content" not in m:
+                    inc("message_missing_key")
+                valid_keys = {"role", "content", "name", "function_call"}
+                if any(k not in valid_keys for k in m.keys()):
+                    inc("message_unrecognized_key")
+                if m.get("role") not in {"system", "user", "assistant", "function"}:
+                    inc("unrecognized_role")
+                content = m.get("content", None)
+                function_call = m.get("function_call", None)
+                if (not content and not function_call) or not isinstance(content, (str, type(None))):
+                    inc("missing_content")
+                if m.get("role") == "assistant":
+                    has_assistant = True
+            if not has_assistant:
+                inc("example_missing_assistant_message")
+
+        if format_errors:
+            lines = ["Found errors:"]
+            for k, v in format_errors.items():
+                lines.append(f"{k}: {v}")
+            lines.append("=> The dataset contains errors.")
+            return "\n".join(lines)
+        return "통과: 형식 오류가 없습니다."
+    except Exception as e:
+        return f"[오류] 검증 실패: {e}"
+
+# -------------------------------
+# Gradio UI
+# -------------------------------
+with gr.Blocks(title="OpenCode: Ollama + DeepSeek-R1 Playground", theme=gr.themes.Soft()) as demo:
+    gr.Markdown(
+        """
+        # 🧩 OpenCode · Ollama + DeepSeek-R1 (로컬)
+        - OpenAI 의존 코드를 **로컬 오픈소스 환경**으로 전환한 예시입니다.
+        - **임베딩**: `nomic-embed-text` · **LLM**: `deepseek-r1:7b`
+        - 좌측 탭에서 기능을 체험하세요.
+        """
+    )
+
+    with gr.Tab("1) 임베딩 데모"):
+        gr.Markdown("단일 문장 임베딩 생성")
+        t_in = gr.Textbox(label="입력 텍스트", value="I am a programmer")
+        btn = gr.Button("임베딩 생성")
+        status = gr.Textbox(label="상태", interactive=False)
+        head = gr.Textbox(label="임베딩 앞부분 미리보기", interactive=False)
+        btn.click(embed_demo, inputs=[t_in], outputs=[status, head])
+
+    with gr.Tab("2) 코사인 유사도"):
+        gr.Markdown("두 벡터 코사인 유사도(NumPy/동일식)")
+        a = gr.Textbox(label="벡터 A (쉼표 구분)", value="2,3,5,2,6,7,9,2,3,4")
+        b = gr.Textbox(label="벡터 B (쉼표 구분)", value="3,6,3,1,0,9,2,3,4,5")
+        btn2 = gr.Button("유사도 계산")
+        out2 = gr.Textbox(label="결과")
+        btn2.click(cosine_demo, inputs=[a, b], outputs=[out2])
+
+    with gr.Tab("3) CSV 임베딩 + 검색"):
+        gr.Markdown("CSV의 텍스트 컬럼을 임베딩하고, 쿼리와 유사한 상위 항목을 찾습니다.")
+        f_csv = gr.File(label="CSV 업로드 (예: words.csv)")
+        col = gr.Textbox(label="텍스트 컬럼명", value="text")
+        q = gr.Textbox(label="검색어(옵션)", value="The black cat sat on the mat")
+        k = gr.Slider(1, 50, 10, step=1, label="TopK")
+        btn3 = gr.Button("임베딩 + 검색 실행")
+        msg3 = gr.Textbox(label="메시지")
+        table3 = gr.Dataframe(label="결과 미리보기")
+        btn3.click(csv_embed_and_search, inputs=[f_csv, col, q, k], outputs=[msg3, table3])
+
+    with gr.Tab("4) 텍스트 분류(라벨 임베딩 기반)"):
+        gr.Markdown("문장을 라벨 임베딩과의 코사인 유사도 최대값으로 분류")
+        sent = gr.Textbox(label="문장 입력", value="새로운 아이폰이 출시되었습니다.")
+        cats = gr.Textbox(label="카테고리 목록(줄바꿈 구분)", value="\n".join(DEFAULT_CATEGORIES), lines=8)
+        btn4 = gr.Button("분류하기")
+        out4 = gr.Textbox(label="결과")
+        btn4.click(classify_sentence, inputs=[sent, cats], outputs=[out4])
+
+    with gr.Tab("5) 스마트 홈 채팅 (few-shot 대체)"):
+        gr.Markdown("파인튜닝 없이 시스템 프롬프트로 역할을 고정한 로컬 채팅")
+        chat = gr.ChatInterface(
+            fn=lambda history, message, temperature: smart_home_chat(history, message, temperature),
+            additional_inputs=[gr.Slider(0.0, 1.0, 0.2, step=0.05, label="Temperature")],
+            title="스마트 홈 어시스턴트",
+            description="DeepSeek-R1 로컬 채팅",
+            retry_btn=None, undo_btn=None, clear_btn="대화 초기화"
+        )
+
+    with gr.Tab("6) 뉴스 정밀도 평가(옵션 파일)"):
+        gr.Markdown("HuffPost 유사 데이터(data/news.json)를 업로드하면 간단 정확도 측정")
+        jf = gr.File(label="data/news.json 업로드")
+        n = gr.Slider(5, 200, 20, step=5, label="평가 샘플 크기")
+        btn6 = gr.Button("평가 실행")
+        score = gr.Textbox(label="정밀도(=정확도)")
+        report = gr.Textbox(label="샘플 결과(일부)", lines=12)
+        btn6.click(evaluate_precision, inputs=[jf, n], outputs=[score, report])
+
+    with gr.Tab("7) JSONL 포맷 검증"):
+        gr.Markdown("메시지 포맷/역할 구조 검증기 (간단 룰)")
+        jlf = gr.File(label="dataset.jsonl 업로드")
+        btn7 = gr.Button("검증")
+        out7 = gr.Textbox(label="검증 결과", lines=12)
+        btn7.click(validate_jsonl, inputs=[jlf], outputs=[out7])
+
+if __name__ == "__main__":
+    # 로컬 실행
+    demo.launch(server_name="0.0.0.0", server_port=7860)
+
+

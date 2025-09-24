@@ -1,0 +1,249 @@
+#64
+"""
+목표: OpenAI 의존 코드를 오픈소스 LLM(DeepSeek-R1, Ollama) + 로컬 임베딩 + Gradio UI로 변환
+
+핵심 전환점
+- ChatOpenAI → ChatOllama(model="deepseek-r1")
+- OpenAIEmbeddings → OllamaEmbeddings(model="nomic-embed-text")
+- API Key 제거(로컬 LLM 사용)
+- PDF 로더 유지(PyPDFLoader) + BM25 + Chroma(EnsembleRetriever)
+- MMR 검색 + (옵션) MultiQueryRetriever 구성
+- Gradio 기반 그래픽 인터페이스 제공
+
+사전 준비(터미널)
+  ollama pull deepseek-r1
+  ollama pull nomic-embed-text
+
+필요 패키지(터미널)
+  pip install -U langchain langchain-community chromadb pypdf bs4 gradio
+
+참고
+- LangChain 0.2+ 권장 import 경로 사용(langchain_community.*)
+- 네트워크/파일 접근 권한 필요 시 OS 권한 확인
+"""
+from __future__ import annotations
+import os
+import tempfile
+from typing import List, Dict, Any
+
+# ---------------------- LangChain: Loaders/Embeddings/Stores ----------------------
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import OllamaEmbeddings
+
+# ---------------------- LangChain: LLM / Retrievers / Chains ----------------------
+from langchain_community.chat_models import ChatOllama
+from langchain.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+
+# ---------------------- UI ----------------------
+import gradio as gr
+
+# ===================== 전역 상태 =====================
+PERSIST_DIR = os.path.join(tempfile.gettempdir(), "pdf_rag_chroma")
+VECTORSTORE = None
+CHROMA_RETRIEVER = None
+BM25 = None
+ENSEMBLE = None
+DOCS: List[Any] = []
+
+# 모델 이름 (Ollama)
+LLM_MODEL = "deepseek-r1"
+EMBED_MODEL = "nomic-embed-text"
+
+# ===================== 유틸/코어 로직 =====================
+
+def load_pdf_docs(pdf_path: str) -> List[Any]:
+    """PDF를 페이지 단위로 로드하여 LangChain 문서 리스트 반환."""
+    loader = PyPDFLoader(pdf_path)
+    pages = loader.load_and_split()
+    return pages
+
+
+def split_docs(docs: List[Any], chunk_size: int = 300, chunk_overlap: int = 50) -> List[Any]:
+    """문서 chunking. 토큰 인코더 의존 없이 견고하게 동작."""
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", "。", "．", "!", "?", ".", " "]
+    )
+    return splitter.split_documents(docs)
+
+
+def build_vectorstore_from_texts(texts: List[Any]) -> Chroma:
+    """Chroma 벡터스토어 생성(로컬 영속)."""
+    embeddings = OllamaEmbeddings(model=EMBED_MODEL)
+    vs = Chroma.from_documents(texts, embedding=embeddings, persist_directory=PERSIST_DIR)
+    vs.persist()
+    return vs
+
+
+def build_retrievers(texts: List[Any], vs: Chroma, k: int = 1, fetch_k: int = 4):
+    """MMR Chroma + BM25 + Ensemble retriever 구성 및 반환."""
+    chroma_ret = vs.as_retriever(search_type="mmr", search_kwargs={"k": k, "fetch_k": fetch_k})
+
+    # BM25는 토큰화/전처리를 내부적으로 수행
+    bm25 = BM25Retriever.from_documents(texts)
+    bm25.k = max(2, k)  # 소량이라도 2개 이상 반환하여 앙상블 가치를 확보
+
+    ensemble = EnsembleRetriever(
+        retrievers=[bm25, chroma_ret],
+        weights=[0.2, 0.8],  # 의미 임베딩 가중치를 더 높게 부여
+    )
+    return chroma_ret, bm25, ensemble
+
+
+def get_multiquery(ensemble):
+    """MultiQueryRetriever: 다양한 관점의 질의 생성 → 앙상블 검색.
+    ChatOllama(DeepSeek-R1)로 질의 생성. (OpenAI 없이 동작)
+    """
+    llm = ChatOllama(model=LLM_MODEL, temperature=0.2, num_ctx=4096)
+    mq = MultiQueryRetriever.from_llm(retriever=ensemble, llm=llm,
+                                      prompt=ChatPromptTemplate.from_template(
+                                          """
+                                          아래 원본 질문을 의미가 다른 5개 한국어 검색 질문으로 변환하세요.
+                                          - 각 줄에 하나의 검색 질문만 출력
+                                          - 불필요한 설명 금지
+                                          원본 질문: {question}
+                                          """))
+    return mq
+
+
+def build_rag_chain(retriever, with_multiquery: bool = False):
+    """retriever(+옵션 MQ) + LLM + 포맷터로 RAG 체인 구성."""
+    llm = ChatOllama(model=LLM_MODEL, temperature=0.2, num_ctx=4096)
+
+    prompt = ChatPromptTemplate.from_template(
+        """
+        아래는 문서에서 찾은 맥락입니다. 이를 바탕으로 질문에 간결하고 정확하게 답하세요.
+        필요하면 핵심 근거를 불릿으로 정리하고, 출처(페이지/메타데이터)가 보이면 함께 표기하세요.
+
+        [맥락]
+        {context}
+
+        [질문]
+        {question}
+        """
+    )
+
+    def format_docs(docs: List[Any]) -> str:
+        blocks = []
+        for d in docs:
+            meta = d.metadata or {}
+            src = meta.get("source", meta.get("file_path", ""))
+            page = meta.get("page", "")
+            snippet = d.page_content.strip().replace("\n", " ")[:500]
+            blocks.append(f"- 출처: {src} (p.{page})\n  내용: {snippet}")
+        return "\n\n".join(blocks)
+
+    base = {"context": retriever | format_docs, "question": RunnablePassthrough()} | prompt | llm | StrOutputParser()
+
+    if with_multiquery:
+        # MultiQueryRetriever 를 retriever 로 대체하여 체인 구성
+        mq = get_multiquery(retriever)
+        return {"context": mq | format_docs, "question": RunnablePassthrough()} | prompt | llm | StrOutputParser()
+
+    return base
+
+
+# ===================== Gradio UI 콜백 =====================
+
+def ui_build_index(pdf_file, chunk_size, chunk_overlap, k, fetch_k):
+    """PDF 업로드 → 분할 → Chroma/BM25/Ensemble 구성."""
+    global VECTORSTORE, CHROMA_RETRIEVER, BM25, ENSEMBLE, DOCS
+
+    if pdf_file is None:
+        return "PDF 파일을 업로드하세요.", None
+
+    # Gradio는 임시 파일 경로를 제공
+    pdf_path = pdf_file.name
+
+    DOCS = load_pdf_docs(pdf_path)
+    chunks = split_docs(DOCS, int(chunk_size), int(chunk_overlap))
+    vs = build_vectorstore_from_texts(chunks)
+    chroma_ret, bm25, ensemble = build_retrievers(chunks, vs, int(k), int(fetch_k))
+
+    VECTORSTORE, CHROMA_RETRIEVER, BM25, ENSEMBLE = vs, chroma_ret, bm25, ensemble
+
+    return (
+        f"인덱스 생성 완료: 문서 {len(DOCS)}개 / 청크 {len(chunks)}개\n"
+        f"MMR(k={k}, fetch_k={fetch_k}), BM25(k={bm25.k})"
+    ), None
+
+
+def ui_ask(question, use_multiquery):
+    if ENSEMBLE is None:
+        return "먼저 PDF로 인덱스를 생성하세요.", []
+    if not question or not question.strip():
+        return "질문을 입력하세요.", []
+
+    chain = build_rag_chain(ENSEMBLE, with_multiquery=bool(use_multiquery))
+    answer = chain.invoke(question.strip())
+
+    # 미리보기: 현재 retriever로 상위 문서 일부 표시
+    docs_preview = ENSEMBLE.get_relevant_documents(question)[:3]
+    rows = []
+    for d in docs_preview:
+        meta = d.metadata or {}
+        rows.append({
+            "page": meta.get("page", ""),
+            "source": meta.get("source", meta.get("file_path", "")),
+            "snippet": d.page_content.strip().replace("\n", " ")[:200],
+        })
+
+    return answer, rows
+
+
+# ===================== Gradio App =====================
+with gr.Blocks(theme=gr.themes.Soft(primary_hue=gr.themes.colors.indigo)) as demo:
+    gr.Markdown("""
+    # 📄 PDF RAG (Ollama + DeepSeek-R1)
+    - 로컬 LLM/임베딩만 사용합니다. (API Key 불필요)
+    - PDF 업로드 → **인덱스 생성** → **질문** 순서로 사용하세요.
+    """)
+
+    with gr.Row():
+        pdf = gr.File(label="PDF 업로드", file_types=[".pdf"], type="filepath")
+
+    with gr.Accordion("인덱싱 설정", open=False):
+        with gr.Row():
+            cs = gr.Slider(200, 1200, value=300, step=50, label="chunk_size")
+            co = gr.Slider(0, 300, value=50, step=10, label="chunk_overlap")
+        with gr.Row():
+            k = gr.Slider(1, 5, value=1, step=1, label="MMR k (반환 문서 수)")
+            fk = gr.Slider(1, 12, value=4, step=1, label="MMR fetch_k (고려 문서 수)")
+        build_btn = gr.Button("인덱스 생성", variant="primary")
+
+    status = gr.Markdown("업로드 후 인덱스를 생성하세요.")
+
+    with gr.Row():
+        q = gr.Textbox(label="질문", placeholder="예) 에코프로에 대해서 알려줘", lines=2)
+    with gr.Row():
+        use_mq = gr.Checkbox(value=False, label="Multi-Query 사용(질문 확장)")
+        ask_btn = gr.Button("질의", variant="primary")
+
+    ans = gr.Markdown(label="답변")
+    table = gr.Dataframe(headers=["page", "source", "snippet"], datatype=["str", "str", "str"], wrap=True, label="참고 문서 (상위 3개)")
+
+    build_btn.click(fn=ui_build_index, inputs=[pdf, cs, co, k, fk], outputs=[status, table])
+    ask_btn.click(fn=ui_ask, inputs=[q, use_mq], outputs=[ans, table])
+
+
+if __name__ == "__main__":
+    print("[안내] Ollama 모델 준비 상태를 확인하세요:")
+    print("  - LLM: deepseek-r1 (ollama pull deepseek-r1)")
+    print("  - Embedding: nomic-embed-text (ollama pull nomic-embed-text)\n")
+
+    demo.launch(server_name="0.0.0.0", server_port=7860)
+
+
+
+
+
+
+

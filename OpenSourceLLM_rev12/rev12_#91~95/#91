@@ -1,0 +1,266 @@
+#91
+"""
+OpenCode: CLIP 제로샷 분류 + 이미지 캡션(Clip-Interrogator) + Gradio
+------------------------------------------------------------------
+- Closed LLM 의존 없음, 모두 오픈소스 로컬 모델(Hugging Face) 사용
+- 기능
+  1) 이미지 업로드/URL 입력
+  2) 사용자 정의 라벨로 CLIP 제로샷 분류 (ViT-B/32)
+  3) 이미지 그리드 미리보기 + 각 이미지별 확률 막대그래프
+  4) (선택) Clip-Interrogator로 자연어 캡션/프롬프트 추정
+- GPU가 있으면 자동으로 CUDA 사용, 없으면 CPU
+
+설치
+  pip install -U torch torchvision pillow requests gradio matplotlib
+  pip install -U transformers
+  pip install -U clip-interrogator==0.6.0  # (선택) 캡션 기능 원하면
+
+실행
+  python clip_zeroshot_gradio.py
+"""
+from __future__ import annotations
+import io
+import os
+import math
+import requests
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+
+import torch
+from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
+import gradio as gr
+
+from transformers import CLIPProcessor, CLIPModel
+
+try:
+    from clip_interrogator import Config, Interrogator
+    HAVE_CI = True
+except Exception:
+    HAVE_CI = False
+
+# =====================================
+# 장치 설정 (GPU 우선)
+# =====================================
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# =====================================
+# 모델/프로세서 로드 (캐싱)
+# =====================================
+@dataclass
+class ClipBundle:
+    model: CLIPModel
+    processor: CLIPProcessor
+
+_CLIP_CACHE: Optional[ClipBundle] = None
+
+
+def load_clip(model_id: str = "openai/clip-vit-base-patch32") -> ClipBundle:
+    global _CLIP_CACHE
+    if _CLIP_CACHE is not None:
+        return _CLIP_CACHE
+    model = CLIPModel.from_pretrained(model_id).to(DEVICE)
+    processor = CLIPProcessor.from_pretrained(model_id)
+    _CLIP_CACHE = ClipBundle(model=model, processor=processor)
+    return _CLIP_CACHE
+
+# =====================================
+# 유틸: 이미지 로딩/그리드/플롯
+# =====================================
+
+def load_image_from_url(url: str) -> Image.Image:
+    resp = requests.get(url, stream=True, timeout=20)
+    resp.raise_for_status()
+    return Image.open(resp.raw).convert("RGB")
+
+
+def image_grid(imgs: List[Image.Image], cols: int = 2) -> Image.Image:
+    if not imgs:
+        raise ValueError("이미지가 비어 있습니다.")
+    w, h = imgs[0].size
+    rows = math.ceil(len(imgs) / cols)
+    grid = Image.new("RGB", size=(cols * w, rows * h), color=(255, 255, 255))
+    for i, img in enumerate(imgs):
+        grid.paste(img, box=((i % cols) * w, (i // cols) * h))
+    return grid
+
+
+def barplot_image(probs: np.ndarray, labels: List[str]) -> Image.Image:
+    # probs: (C,) 실수 배열
+    fig, ax = plt.subplots(figsize=(4.2, 2.6), dpi=150)
+    y = np.arange(len(labels))
+    ax.barh(y, probs, color="#4F46E5")
+    ax.set_yticks(y, labels)
+    ax.set_xlim(0, 1.0)
+    ax.invert_yaxis()
+    for i, p in enumerate(probs):
+        ax.text(min(0.98, p + 0.02), i, f"{p:.2f}", va="center")
+    ax.set_xlabel("Probability")
+    ax.grid(axis="x", linestyle=":", alpha=0.4)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return Image.open(buf)
+
+# =====================================
+# 제로샷 분류
+# =====================================
+
+def zeroshot_classify(images: List[Image.Image], labels: List[str]) -> Tuple[List[np.ndarray], List[int]]:
+    bundle = load_clip()
+    model, processor = bundle.model, bundle.processor
+    with torch.no_grad():
+        inputs = processor(text=labels, images=images, return_tensors="pt", padding=True)
+        # CPU/GPU 장치 배치
+        inputs = {k: v.to(DEVICE) if hasattr(v, "to") else v for k, v in inputs.items()}
+        outputs = model(**inputs)
+        logits_per_image = outputs.logits_per_image  # (N, C)
+        probs = logits_per_image.softmax(dim=1).detach().cpu().numpy()
+        pred_idx = probs.argmax(axis=1).tolist()
+    return [p for p in probs], pred_idx
+
+# =====================================
+# Clip-Interrogator 캡션
+# =====================================
+_CI: Optional[Interrogator] = None
+
+def load_interrogator(clip_model_name: str = "ViT-L-14/openai") -> Optional[Interrogator]:
+    global _CI
+    if not HAVE_CI:
+        return None
+    if _CI is not None:
+        return _CI
+    cfg = Config(clip_model_name=clip_model_name)
+    _CI = Interrogator(cfg)
+    return _CI
+
+
+def generate_captions(images: List[Image.Image]) -> List[str]:
+    ci = load_interrogator()
+    if ci is None:
+        return ["(clip-interrogator 미설치)"] * len(images)
+    caps = []
+    for img in images:
+        caps.append(ci.interrogate(img))
+    return caps
+
+# =====================================
+# Gradio 핸들러
+# =====================================
+
+def run_pipeline(
+    upload_imgs: List[np.ndarray],
+    url_text: str,
+    labels_text: str,
+    cols: int,
+    want_captions: bool,
+) -> Tuple[Image.Image, List[Image.Image], List[str]]:
+    # 1) 이미지 수집 (업로드 + URL)
+    imgs: List[Image.Image] = []
+    if upload_imgs:
+        for arr in upload_imgs:
+            imgs.append(Image.fromarray(arr.astype(np.uint8)).convert("RGB"))
+    urls = [u.strip() for u in (url_text or "").splitlines() if u.strip()]
+    for u in urls:
+        try:
+            imgs.append(load_image_from_url(u))
+        except Exception as e:
+            print(f"[URL 로드 실패] {u}: {e}")
+    if not imgs:
+        raise gr.Error("이미지를 업로드하거나 URL을 입력하세요.")
+
+    # 2) 라벨 파싱
+    labels = [x.strip() for x in labels_text.split(',') if x.strip()]
+    if not labels:
+        raise gr.Error("라벨을 콤마(,)로 구분해 입력하세요. 예) giraffe,zebra,elephant,person,toy")
+
+    # 3) 제로샷 분류
+    probs_list, pred_idx = zeroshot_classify(imgs, labels)
+
+    # 4) 그리드 썸네일
+    grid = image_grid([im.resize((384, 384)) for im in imgs], cols=max(1, int(cols)))
+
+    # 5) 각 이미지별 막대그래프 + (선택) 캡션
+    caps = generate_captions(imgs) if want_captions else [""] * len(imgs)
+
+    viz_rows: List[Image.Image] = []
+    txt_rows: List[str] = []
+    for i, (probs, pidx) in enumerate(zip(probs_list, pred_idx)):
+        bar = barplot_image(probs, labels)
+        viz_rows.append(bar)
+        label = labels[pidx]
+        caption = caps[i]
+        txt = f"Top-1: {label} ({probs[pidx]:.2f})"
+        if want_captions:
+            txt += f"\nCaption: {caption}"
+        txt_rows.append(txt)
+
+    return grid, viz_rows, txt_rows
+
+# =====================================
+# Gradio UI
+# =====================================
+with gr.Blocks(title="CLIP 제로샷 분류 + 캡션", theme=gr.themes.Soft()) as demo:
+    gr.Markdown(
+        """
+        # 🖼️ CLIP 제로샷 분류 + 캡션 (로컬)
+        - 모델: `openai/clip-vit-base-patch32` (Hugging Face, 로컬 캐시)
+        - 캡션: `clip-interrogator` (설치한 경우에만)
+        """
+    )
+
+    with gr.Row():
+        img_uploader = gr.Gallery(label="이미지 업로드", columns=4, allow_preview=True).style(grid=[4])
+
+    with gr.Row():
+        url_box = gr.Textbox(label="이미지 URL (줄바꿈으로 여러 개)")
+    labels_box = gr.Textbox(label="라벨(클래스), 콤마로 구분", value="giraffe,zebra,elephant,person,toy")
+    cols_slider = gr.Slider(1, 4, value=2, step=1, label="그리드 열 수")
+    cap_ck = gr.Checkbox(value=False, label="Clip-Interrogator 캡션 생성(선택)")
+
+    run_btn = gr.Button("실행", variant="primary")
+
+    grid_out = gr.Image(label="그리드 미리보기")
+    bars_out = gr.Gallery(label="각 이미지 확률 막대그래프", columns=2)
+    txt_out = gr.HighlightedText(label="Top-1/캡션 텍스트", combine_adjacent=True)
+
+    def _gallery_to_arrays(gal_items):
+        # Gradio Gallery는 업로드 시 리스트 형태로 전달됨.
+        # 각 항목은 dict 또는 ndarray일 수 있음. ndarray만 추려 반환.
+        if not gal_items:
+            return []
+        arrs = []
+        for it in gal_items:
+            if isinstance(it, dict) and "name" in it and "data" in it:
+                arrs.append(it["data"])  # ndarray
+            elif isinstance(it, np.ndarray):
+                arrs.append(it)
+        return arrs
+
+    run_btn.click(
+        lambda gal, url, labels, cols, cap: run_pipeline(_gallery_to_arrays(gal), url, labels, cols, cap),
+        inputs=[img_uploader, url_box, labels_box, cols_slider, cap_ck],
+        outputs=[grid_out, bars_out, txt_out]
+    )
+
+    gr.Markdown(
+        """
+        ### 팁
+        - 라벨 문구는 자유롭게 바꿀 수 있습니다. (예: "cat,dog,car,airplane")
+        - 캡션 기능은 `clip-interrogator` 설치 시 활성화됩니다. 처음 실행 때 가중치 다운로드로 시간이 걸릴 수 있습니다.
+        - 대량 이미지는 GPU를 권장합니다. CPU에서도 동작하지만 느릴 수 있습니다.
+        """
+    )
+
+if __name__ == "__main__":
+    # 사전 로딩(선택): 첫 호출 지연을 줄이고 싶으면 미리 로드
+    _ = load_clip()
+    demo.launch()
+
+
+# pip install -U torch torchvision pillow requests gradio matplotlib transformers
+# (선택) 캡션 기능:
+# pip install –U clip-interrogator==0.6.0

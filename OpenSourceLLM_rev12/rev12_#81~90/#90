@@ -1,0 +1,293 @@
+#90
+"""
+OpenCode 변환본: OpenAI TTS 코드 → 로컬 Coqui TTS + Gradio
+---------------------------------------------------------
+- API Key, OpenAI 의존 제거
+- 순수 로컬 TTS(오픈소스): Coqui TTS (https://github.com/coqui-ai/TTS)
+- 한국어 기본 모델 포함: "tts_models/ko/kss/glow-tts"
+- 멀티 스피커/다국어 모델 옵션 포함: "tts_models/multilingual/multi-dataset/your_tts" 등
+- 출력: WAV 기본, pydub + ffmpeg가 있으면 MP3도 자동 저장
+- GUI: Gradio, 또한 CLI 단발 실행 지원
+
+사전 준비
+1) 필수 설치
+   pip install -U TTS gradio soundfile numpy
+   # (선택) MP3 저장을 원하면
+   pip install -U pydub
+   # ffmpeg 설치(플랫폼별): https://ffmpeg.org/download.html
+
+2) 실행
+   python tts_ollama_local_gradio.py
+   브라우저에서 텍스트 입력 → 음성 모델/화자 선택 → 합성
+
+폴더 구조 예시(자동 생성)
+- src/data/tts/speech_ko.txt (샘플 텍스트)
+- src/data/tts/outputs/ (합성 결과)
+"""
+from __future__ import annotations
+import os
+import time
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
+import numpy as np
+import soundfile as sf
+
+try:
+    from pydub import AudioSegment  # MP3 변환용(선택)
+    HAVE_PYDUB = True
+except Exception:
+    HAVE_PYDUB = False
+
+import gradio as gr
+from TTS.api import TTS
+
+# ===============================
+# 경로/유틸
+# ===============================
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "src", "data", "tts")
+OUT_DIR = os.path.join(DATA_DIR, "outputs")
+SAMPLE_TXT = os.path.join(DATA_DIR, "speech_ko.txt")
+
+os.makedirs(OUT_DIR, exist_ok=True)
+if not os.path.exists(SAMPLE_TXT):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(SAMPLE_TXT, "w", encoding="utf-8") as f:
+        f.write("안녕 네오 – 매트릭스에 오신 것을 환영합니다.")
+
+# ===============================
+# Coqui TTS 모델 관리
+# ===============================
+@dataclass
+class ModelSpec:
+    name: str  # 표시명
+    repo_id: str  # Coqui TTS model id
+    note: str  # 설명
+
+# 자주 쓰는 모델 모음 (필요시 추가)
+MODEL_CATALOG: List[ModelSpec] = [
+    ModelSpec(
+        name="Korean: Glow-TTS (ko)",
+        repo_id="tts_models/ko/kss/glow-tts",
+        note="한국어 단일 화자(품질 우수, 빠름)",
+    ),
+    ModelSpec(
+        name="Multilingual: YourTTS (multi)",
+        repo_id="tts_models/multilingual/multi-dataset/your_tts",
+        note="다국어/멀티스피커, 기준 음성(클로닝)도 지원",
+    ),
+    ModelSpec(
+        name="English: VITS VCTK (en, multi-speaker)",
+        repo_id="tts_models/en/vctk/vits",
+        note="영어 멀티 스피커",
+    ),
+]
+
+# 캐시: 로딩된 TTS 인스턴스 재사용
+_TTS_CACHE = {}
+
+
+def load_tts(repo_id: str) -> TTS:
+    if repo_id in _TTS_CACHE:
+        return _TTS_CACHE[repo_id]
+    t0 = time.time()
+    tts = TTS(model_name=repo_id)  # 최초 실행 시 모델 가중치 자동 다운로드
+    _TTS_CACHE[repo_id] = tts
+    print(f"[TTS] Loaded {repo_id} in {time.time() - t0:.2f}s")
+    return tts
+
+
+# ===============================
+# 합성 함수
+# ===============================
+
+def synthesize(
+    text: str,
+    model_label: str,
+    speaker: Optional[str] = None,
+    language: Optional[str] = None,
+    file_basename: str = "speech_ko",
+    save_mp3: bool = True,
+) -> Tuple[str, str, List[str]]:
+    """
+    입력 텍스트를 선택한 Coqui TTS 모델로 합성하여 파일 저장.
+    - speaker: 멀티스피커 모델에서 화자명 (없으면 기본)
+    - language: 다국어 모델에서 언어코드 (예: "ko", "en", "ja", ...)
+    - 반환: (미리듣기 파일 경로, 저장된 메세지, 생성된 파일 목록)
+    """
+    if not text or not text.strip():
+        return "", "입력 텍스트가 비어 있습니다.", []
+
+    # 모델 ID 찾기
+    repo_id = next((m.repo_id for m in MODEL_CATALOG if m.name == model_label), None)
+    if repo_id is None:
+        return "", f"알 수 없는 모델: {model_label}", []
+
+    # 모델 로드
+    tts = load_tts(repo_id)
+
+    # 출력 파일명
+    wav_path = os.path.join(OUT_DIR, f"{file_basename}.wav")
+
+    # 합성 실행
+    # Coqui TTS는 모델마다 지원 파라미터가 다르므로 공통 파라미터만 사용
+    # tts_to_file는 내부에서 샘플레이트/채널을 처리해 WAV 저장
+    kwargs = {}
+    if speaker:
+        kwargs["speaker"] = speaker
+    if language:
+        kwargs["language"] = language
+
+    try:
+        tts.tts_to_file(text=text, file_path=wav_path, **kwargs)
+    except TypeError as e:
+        # 일부 모델은 language/speaker 미지원 → 파라미터 제거 후 재시도
+        if "unexpected keyword" in str(e):
+            kwargs = {}
+            tts.tts_to_file(text=text, file_path=wav_path)
+        else:
+            raise
+
+    created_files = [wav_path]
+    preview_path = wav_path
+    msg = f"WAV 저장: {os.path.relpath(wav_path, BASE_DIR)}"
+
+    # MP3 변환(선택)
+    if save_mp3 and HAVE_PYDUB:
+        mp3_path = os.path.join(OUT_DIR, f"{file_basename}.mp3")
+        try:
+            audio = AudioSegment.from_wav(wav_path)
+            audio.export(mp3_path, format="mp3", bitrate="192k")
+            created_files.append(mp3_path)
+            preview_path = mp3_path  # Gradio Audio는 mp3 재생이 편리
+            msg += f"\nMP3 저장: {os.path.relpath(mp3_path, BASE_DIR)}"
+        except Exception as e:
+            msg += f"\nMP3 변환 실패(pydub/ffmpeg 필요): {e}"
+
+    return preview_path, msg, [os.path.relpath(p, BASE_DIR) for p in created_files]
+
+
+# ===============================
+# 스피커/언어 조회
+# ===============================
+
+def list_speakers_and_langs(model_label: str) -> Tuple[List[str], List[str]]:
+    repo_id = next((m.repo_id for m in MODEL_CATALOG if m.name == model_label), None)
+    if repo_id is None:
+        return [], []
+    tts = load_tts(repo_id)
+    speakers = getattr(tts, "speakers", []) or []
+    languages = getattr(tts, "languages", []) or []
+    # 문자열 리스트 보장
+    speakers = [str(s) for s in speakers]
+    languages = [str(l) for l in languages]
+    return speakers, languages
+
+
+# ===============================
+# Gradio UI
+# ===============================
+
+MODEL_NAMES = [m.name for m in MODEL_CATALOG]
+DEFAULT_MODEL_NAME = MODEL_NAMES[0]
+
+with gr.Blocks(title="로컬 TTS (Coqui) — OpenCode", theme=gr.themes.Soft()) as demo:
+    gr.Markdown(
+        """
+        # 🗣️ 로컬 TTS (Coqui) — OpenCode
+        - 오픈소스 Coqui TTS로 **완전 로컬** 음성 합성
+        - 한국어 기본 모델 제공, 다국어/멀티 스피커 모델 선택 가능
+        - MP3 변환은 pydub+ffmpeg가 있을 때 자동 활성화
+        """
+    )
+
+    with gr.Row():
+        txt = gr.Textbox(label="텍스트 입력", value="안녕 네오 – 매트릭스에 오신 것을 환영합니다.", lines=3)
+
+    with gr.Row():
+        model_dd = gr.Dropdown(MODEL_NAMES, value=DEFAULT_MODEL_NAME, label="음성 모델")
+        spk_dd = gr.Dropdown([], label="화자(speaker)", info="모델 선택 후 자동 채움", interactive=True)
+        lang_dd = gr.Dropdown([], label="언어(language)", info="다국어 모델만 표시", interactive=True)
+        base_fn = gr.Textbox(value="speech_ko", label="파일 베이스명")
+        mp3_cb = gr.Checkbox(value=True, label="MP3도 저장(pydub/ffmpeg 필요)")
+
+    refresh_btn = gr.Button("모델 정보 새로고침(화자/언어)")
+
+    with gr.Row():
+        run_btn = gr.Button("합성 실행", variant="primary")
+
+    audio_out = gr.Audio(label="미리듣기", autoplay=False)
+    msg_out = gr.Textbox(label="저장 로그", lines=4)
+    files_out = gr.JSON(label="생성된 파일 목록")
+
+    # 이벤트: 모델 변경 시 화자/언어 채우기
+    def _refresh(model_label):
+        speakers, languages = list_speakers_and_langs(model_label)
+        # 빈 항목 추가(선택 안함)
+        speakers = [""] + speakers if speakers else []
+        languages = [""] + languages if languages else []
+        return gr.update(choices=speakers, value=("" if speakers else None)), \
+               gr.update(choices=languages, value=("" if languages else None))
+
+    model_dd.change(_refresh, inputs=[model_dd], outputs=[spk_dd, lang_dd])
+    refresh_btn.click(_refresh, inputs=[model_dd], outputs=[spk_dd, lang_dd])
+
+    # 합성 실행
+    def _run(text, model_label, speaker, language, base_name, mp3_on):
+        spk = speaker.strip() if speaker else None
+        lang = language.strip() if language else None
+        return synthesize(text, model_label, spk, lang, base_name.strip() or "speech", save_mp3=bool(mp3_on))
+
+    run_btn.click(_run, inputs=[txt, model_dd, spk_dd, lang_dd, base_fn, mp3_cb], outputs=[audio_out, msg_out, files_out])
+
+    gr.Markdown(
+        """
+        ### 팁
+        - 한국어만 필요하면 **Korean: Glow-TTS** 모델이 간단하고 빠릅니다.
+        - 멀티 스피커 모델은 `speaker` 목록에서 다양한 화자를 선택할 수 있습니다.
+        - 긴 문장은 문장부호로 적절히 끊어 주면 발음/리듬이 자연스러워집니다.
+        - MP3 변환이 실패하면 ffmpeg 설치를 확인하세요.
+        """
+    )
+
+# ===============================
+# CLI 실행 (옵션)
+# ===============================
+
+def cli_demo_example() -> bool:
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--text", type=str, help="합성할 텍스트")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL_NAME, choices=MODEL_NAMES)
+    parser.add_argument("--speaker", type=str, default="")
+    parser.add_argument("--language", type=str, default="")
+    parser.add_argument("--base", type=str, default="speech_cli")
+    parser.add_argument("--no-mp3", action="store_true")
+    args = parser.parse_args()
+
+    if not args.text:
+        return False
+
+    prev, msg, files = synthesize(
+        text=args.text,
+        model_label=args.model,
+        speaker=(args.speaker or None),
+        language=(args.language or None),
+        file_basename=args.base,
+        save_mp3=(not args.no_mp3),
+    )
+    print("미리듣기 파일:", prev)
+    print("메시지:\n", msg)
+    print("생성 파일:", files)
+    return True
+
+
+if __name__ == "__main__":
+    if not cli_demo_example():
+        demo.launch()
+
+# pip install -U TTS gradio soundfile numpy
+# (선택) MP3 저장 원하면:
+# pip install -U pydub   # + ffmpeg 설치
+

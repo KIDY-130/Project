@@ -1,0 +1,197 @@
+#57
+"""
+OpenCode 변환본 (Gradio + Ollama + DeepSeek-R1)
+
+- 목적: ChatGPT 등 Closed LLM 의존 코드를, 로컬 오픈소스 LLM(DeepSeek-R1, Ollama)로 교체
+- UI: Streamlit → Gradio
+- LLM: langchain 제거, ollama 패키지 직접 사용 (로컬 PC에 모델 설치되어 있다고 가정)
+- 주석: 동작 흐름과 수정 포인트를 자세히 설명
+
+[사전 준비]
+1) Ollama 설치 및 실행: https://ollama.com
+2) DeepSeek-R1 모델 받기(예: 8B):
+   $ ollama pull deepseek-r1:8b
+   (다른 사이즈 사용 가능: deepseek-r1, deepseek-r1:32b 등)
+3) 파이썬 패키지:
+   $ pip install gradio ollama
+
+[실행]
+   $ python app.py
+"""
+
+from __future__ import annotations
+import re
+from typing import Literal
+import gradio as gr
+import ollama
+
+# ------------------------------
+# 설정값: 모델 이름 및 기본 파라미터
+# ------------------------------
+MODEL_NAME = "deepseek-r1:8b"  # Ollama에 설치된 모델 태그와 동일해야 합니다.
+DEFAULT_TEMPERATURE = 0.7
+MAX_TOKENS = 1024  # deepseek-r1은 내부적으로 추론 길이 제약이 있으니 과도하게 크게 잡지 마세요.
+
+
+# ------------------------------
+# 유틸: DeepSeek-R1의 <think> ... </think> 사유(Reasoning) 블록 제거
+#  - R1 계열은 추론 중간 과정을 <think> 태그로 감싸서 반환합니다.
+#  - 최종 사용자에게는 최종 답변만 보여주기 위해 해당 블록을 제거합니다.
+# ------------------------------
+THINK_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def strip_reasoning(text: str) -> str:
+    """
+    DeepSeek-R1이 생성한 응답에서 <think>...</think> 구간을 제거하여
+    최종 결과만 남겨 반환합니다.
+    """
+    return THINK_BLOCK_PATTERN.sub("", text).strip()
+
+
+# ------------------------------
+# 프롬프트 템플릿
+#  - 사용자가 고른 언어(한국어/English)에 맞춰 이메일을 작성
+#  - 한문 제외 조건은 한국어 케이스에만 반영 (원 코드 요구사항 그대로 유지)
+# ------------------------------
+def build_prompt(
+    email_topic: str,
+    sender: str,
+    recipient: str,
+    language: Literal["한국어", "English"],
+) -> str:
+    if language == "한국어":
+        return (
+            f"{email_topic} 주제를 포함한 이메일을 작성해 주세요.\n\n"
+            f"보낸 사람: {sender}\n"
+            f"받는 사람: {recipient}\n"
+            f"전부 {language}로 번역해서 작성해주세요. 한문은 내용에서 제외해주세요.\n\n"
+            f"이메일 내용:\n"
+        )
+    else:
+        return (
+            f"Write an email including the topic: {email_topic}.\n\n"
+            f"Sender: {sender}\n"
+            f"Recipient: {recipient}\n"
+            f"Please write the entire email in {language}.\n\n"
+            f"Email content:\n"
+        )
+
+
+# ------------------------------
+# LLM 호출
+#  - ollama.chat()을 사용해 로컬 서버(기본 127.0.0.1:11434)에 요청
+#  - system 프롬프트로 역할 부여(정중하고 간결하게, 이메일 형식 유지)
+#  - 응답에서 <think> 제거
+# ------------------------------
+def generate_email(
+    email_topic: str,
+    email_sender: str,
+    email_recipient: str,
+    language: Literal["한국어", "English"] = "한국어",
+    temperature: float = DEFAULT_TEMPERATURE,
+) -> str:
+    # 간단한 유효성 검사
+    if not email_topic.strip():
+        return "❗ 이메일 주제를 입력해 주세요."
+    if not email_sender.strip():
+        return "❗ 보낸 사람 이름을 입력해 주세요."
+    if not email_recipient.strip():
+        return "❗ 받는 사람 이름을 입력해 주세요."
+
+    prompt = build_prompt(email_topic, email_sender, email_recipient, language)
+
+    # system 메시지로 이메일 가이드라인 제공
+    system_instruction = (
+        "You are an assistant that writes well-structured, polite, and concise emails. "
+        "Use clear subject lines if implied, a friendly greeting, organized paragraphs, "
+        "and an appropriate closing with the sender's name."
+    )
+
+    try:
+        # Ollama Chat API 호출
+        res = ollama.chat(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": prompt},
+            ],
+            options={
+                "temperature": float(temperature),
+                "num_predict": int(MAX_TOKENS),
+            },
+        )
+        raw_text = res.get("message", {}).get("content", "")
+        return strip_reasoning(raw_text) or "⚠️ 모델이 빈 응답을 반환했습니다. 프롬프트를 바꿔 다시 시도해 보세요."
+    except Exception as e:
+        # Ollama 서버 미실행/모델 미설치/네트워크 오류 등
+        return (
+            "🚫 LLM 호출 중 오류가 발생했습니다.\n"
+            f"- 원인: {e}\n\n"
+            "확인하세요:\n"
+            "1) Ollama가 실행 중인지 (기본 포트 11434)\n"
+            "2) `ollama pull deepseek-r1:8b`로 모델이 설치되어 있는지\n"
+            "3) 방화벽/프록시 등 네트워크 이슈가 없는지"
+        )
+
+
+# ------------------------------
+# Gradio UI
+#  - 언어 선택, 주제, 보낸 사람/받는 사람 입력
+#  - 생성 버튼 클릭 시 generate_email 호출
+#  - 좌측: 입력, 우측: 결과 미리보기
+# ------------------------------
+with gr.Blocks(title="이메일 생성기 📮 (Ollama + DeepSeek-R1)") as demo:
+    gr.Markdown(
+        """
+        # 이메일 생성기 📮
+        로컬 오픈소스 LLM(DeepSeek-R1, Ollama)을 사용하여 이메일을 생성합니다.  
+        **모델:** `deepseek-r1:8b` (설정에서 변경 가능)
+        """
+    )
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            language = gr.Dropdown(
+                label="이메일 작성 언어",
+                choices=["한국어", "English"],
+                value="한국어",
+            )
+            topic = gr.Textbox(label="이메일 주제", placeholder="예: 회의 일정 조율 요청", lines=3)
+            with gr.Row():
+                sender = gr.Textbox(label="보낸 사람 이름", placeholder="홍길동")
+                recipient = gr.Textbox(label="받는 사람 이름", placeholder="김철수")
+
+            temperature = gr.Slider(
+                0.0, 1.5, value=DEFAULT_TEMPERATURE, step=0.05, label="창의성 (temperature)"
+            )
+            generate_btn = gr.Button("생성하기", variant="primary")
+
+        with gr.Column(scale=1):
+            output = gr.Markdown(label="생성된 이메일")
+
+    # 버튼 클릭 → 함수 실행 매핑
+    generate_btn.click(
+        fn=generate_email,
+        inputs=[topic, sender, recipient, language, temperature],
+        outputs=[output],
+    )
+
+    gr.Markdown(
+        """
+        ---  
+        ### 팁
+        - 더 상세한 결과를 원하시면 주제에 **목적/상황/톤**을 구체적으로 적어보세요.  
+        - 한국어 모드에서는 *한문 제외* 규칙이 적용됩니다.  
+        - 모델 크기를 바꾸려면 파일 상단의 `MODEL_NAME` 값을 수정하세요.
+        """
+    )
+
+# Gradio 앱 실행
+if __name__ == "__main__":
+    # queue()는 동시 요청 처리 안정성 향상을 위한 권장 설정
+    demo.queue().launch(server_name="0.0.0.0", server_port=7860, show_api=False)
+
+
+
+

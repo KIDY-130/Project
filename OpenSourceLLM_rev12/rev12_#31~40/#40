@@ -1,0 +1,62 @@
+#40
+import gradio as gr
+import subprocess
+
+# Ollama를 통해 DeepSeek-R1 모델에 스트리밍 질의하는 함수
+def query_deepseek_stream(user_text):
+    """
+    Ollama CLI를 사용하여 DeepSeek-R1 모델을 스트리밍 모드로 실행하고,
+    토큰 단위로 출력되는 결과를 yield 하여 스트리밍 응답을 구현
+    """
+    try:
+        # ollama run을 subprocess.Popen으로 실행 (실시간 stdout 읽기 가능)
+        process = subprocess.Popen(
+            ["ollama", "run", "deepseek-r1", user_text],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1
+        )
+
+        # stdout을 한 줄씩 읽으면서 yield
+        for line in iter(process.stdout.readline, ""):
+            if line.strip():
+                yield line.strip()
+
+        process.stdout.close()
+        process.wait()
+    except Exception as e:
+        yield f"에러 발생: {str(e)}"
+
+
+# Gradio용 함수 (스트리밍 출력 지원)
+def chat_with_model(user_text):
+    return query_deepseek_stream(user_text)
+
+
+# Gradio 인터페이스 구성
+with gr.Blocks() as demo:
+    gr.Markdown("## 💬 DeepSeek-R1 스트리밍 챗봇 (Ollama 기반)")
+    gr.Markdown("Python 재귀 피보나치 예제 코드 같은 질문을 입력해 보세요!")
+
+    with gr.Row():
+        user_input = gr.Textbox(
+            label="질문 입력",
+            placeholder="예: Python 재귀 피보나치 코드 작성해주세요."
+        )
+    with gr.Row():
+        output = gr.Textbox(
+            label="모델 응답 (실시간 스트리밍)",
+            placeholder="여기에 모델의 답변이 스트리밍 출력됩니다."
+        )
+
+    # 버튼 이벤트 (스트리밍 지원)
+    submit_btn = gr.Button("전송")
+    submit_btn.click(fn=chat_with_model, inputs=user_input, outputs=output)
+
+# 실행
+if __name__ == "__main__":
+    demo.launch()
+
+
+

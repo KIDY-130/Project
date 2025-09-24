@@ -1,0 +1,315 @@
+#71
+# pip install langchain langchain-community langchain-text-splitters chromadb 
+# gradio duckduckgo-search "unstructured[md]" html2text
+
+"""
+오픈소스 LLM(Ollama + DeepSeek-R1) 기반 RAG + Gradio 데모
+- 닫힌 LLM(OpenAI) 의존성 제거
+- LangChain + Chroma + Ollama 임베딩/챗
+- 금융 관련 포털 페이지를 간단 크롤링하여 로컬 RAG 인덱스 구성
+- Gradio UI 제공
+
+작성자 메모:
+- 크롤링 대상 사이트는 robots 및 접속 제한에 따라 로컬 환경에서 결과가 다를 수 있습니다.
+- 필요 시 URL을 여러분 환경에 맞게 바꾸세요.
+"""
+
+# =========================
+# 1) 기본 의존성 임포트
+# =========================
+import os
+from typing import List, Dict, Any, Tuple
+
+# LangChain - 로더/임베딩/LLM/벡터스토어
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.chat_models import ChatOllama
+from langchain_community.vectorstores import Chroma
+from langchain.schema import Document
+
+# 출력 파서/프롬프트
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+# UI
+import gradio as gr
+
+
+# =========================
+# 2) 설정(모델/URL 등)
+# =========================
+# 로컬 Ollama 모델 이름 (사전 pull 필요)
+CHAT_MODEL_NAME = "deepseek-r1:latest"        # 추론/답변용
+EMBED_MODEL_NAME = "nomic-embed-text:latest"  # 문서 임베딩용
+
+# 인덱싱할 URL 목록 (필요 시 교체/추가)
+CRAWL_URLS = [
+    "https://finance.naver.com/",
+    "https://finance.yahoo.com/",
+    "https://finance.daum.net/",
+]
+
+# Chroma 컬렉션/저장 경로 (원하면 영속 디렉터리 사용)
+CHROMA_COLLECTION = "rag-chroma"
+CHROMA_PERSIST_DIR = None  # 예: "./.chroma_finance" 로 두면 디스크에 영속화
+
+
+# =========================
+# 3) 유틸: 문서 로드/분할/색인
+# =========================
+def load_docs(urls: List[str]) -> List[Document]:
+    """
+    간단한 웹 문서 로더.
+    - WebBaseLoader는 사이트에 따라 차단될 수 있으므로 필요시 로더 교체.
+    """
+    docs: List[Document] = []
+    for u in urls:
+        try:
+            loader = WebBaseLoader(u)
+            loaded = loader.load()
+            docs.extend(loaded)
+        except Exception as e:
+            # 크롤링 실패해도 전체 파이프라인은 계속 진행
+            print(f"[WARN] Failed to load {u}: {e}")
+    return docs
+
+
+def split_docs(docs: List[Document],
+               chunk_size: int = 800,
+               chunk_overlap: int = 160) -> List[Document]:
+    """
+    OpenAI 토크나이저에 의존하지 않는 일반 문자 기반 분할기.
+    """
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", " ", ""],
+    )
+    return splitter.split_documents(docs)
+
+
+def build_vectorstore(doc_splits: List[Document]) -> Chroma:
+    """
+    Ollama 임베딩으로 Chroma 벡터스토어 구성.
+    """
+    embeddings = OllamaEmbeddings(model=EMBED_MODEL_NAME)
+    vs = Chroma.from_documents(
+        documents=doc_splits,
+        embedding=embeddings,
+        collection_name=CHROMA_COLLECTION,
+        persist_directory=CHROMA_PERSIST_DIR
+    )
+    return vs
+
+
+# =========================
+# 4) LLM 관련(질의 재작성/판정/생성)
+# =========================
+def get_chat_model(temperature: float = 0.2) -> ChatOllama:
+    """
+    로컬 Ollama 기반 DeepSeek-R1 챗 모델 구성.
+    """
+    return ChatOllama(model=CHAT_MODEL_NAME, temperature=temperature)
+
+
+def grade_relevance(question: str, context: str) -> bool:
+    """
+    문맥(context)이 질문(question)과 관련 있는지 이진 판정.
+    DeepSeek-R1에 간단한 프롬프트로 yes/no 요청.
+    """
+    prompt = PromptTemplate.from_template(
+        """다음 문맥이 사용자 질문과 의미적으로 관련이 있으면 'yes', 아니면 'no'만 출력하세요.
+[질문]
+{question}
+
+[문맥]
+{context}
+
+정답:"""
+    )
+    chain = prompt | get_chat_model(temperature=0.0) | StrOutputParser()
+    try:
+        result = chain.invoke({"question": question, "context": context}).strip().lower()
+        return "yes" in result[:5]  # 'yes'로 시작/포함하면 True
+    except Exception as e:
+        print(f"[WARN] grade_relevance error: {e}")
+        return True  # 판정 실패 시 보수적으로 관련 있다고 처리
+
+
+def rewrite_query(original: str) -> str:
+    """
+    질의가 모호하거나 관련 문서를 못 찾은 경우, 질의 재작성.
+    """
+    prompt = PromptTemplate.from_template(
+        """다음 질문을 더 명확하고 검색 친화적으로 1문장으로 재작성하세요.
+원문: {q}
+재작성:"""
+    )
+    chain = prompt | get_chat_model(temperature=0.2) | StrOutputParser()
+    try:
+        return chain.invoke({"q": original}).strip()
+    except Exception as e:
+        print(f"[WARN] rewrite_query error: {e}")
+        return original
+
+
+def generate_answer(question: str, context: str, max_sentences: int = 3) -> str:
+    """
+    RAG 최종 응답 생성.
+    - 모르면 '모르겠습니다'로 응답
+    - 한국어 간결 답변(최대 N문장)
+    """
+    prompt = PromptTemplate.from_template(
+        """당신은 금융 관련 질문에 간결히 답하는 어시스턴트입니다.
+아래 '문맥'을 활용해 '질문'에 답하세요.
+- 문맥에 근거가 부족하면 "모르겠습니다."라고 답하세요.
+- 한국어로 {n}문장 이내로 간결히 작성하세요.
+
+[질문]
+{question}
+
+[문맥]
+{context}
+
+[답변]"""
+    )
+    chain = prompt | get_chat_model(temperature=0.2) | StrOutputParser()
+    try:
+        return chain.invoke({"question": question, "context": context, "n": max_sentences}).strip()
+    except Exception as e:
+        print(f"[ERROR] generate_answer error: {e}")
+        return "모르겠습니다."
+
+
+# =========================
+# 5) RAG 파이프라인 (한 번 재작성까지)
+# =========================
+def run_rag_pipeline(
+    question: str,
+    vectorstore: Chroma,
+    k: int = 6
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    - retriever로 top-k 문서 가져오기
+    - 관련성 판정 실패 시 질의 재작성 → 다시 검색
+    - 최종 컨텍스트로 답안 생성
+    - 반환: (answer, sources)
+      sources: [{"source": url/path, "snippet": text}, ...]
+    """
+    retriever = vectorstore.as_retriever(search_kwargs={"k": k})
+
+    def fetch_ctx(q: str) -> Tuple[str, List[Document]]:
+        docs = retriever.get_relevant_documents(q)
+        # 간단히 상위 몇 개를 concat하여 컨텍스트 구성
+        ctx_parts = []
+        for d in docs:
+            # 너무 길면 컨텍스트 폭주하므로 앞부분만 사용
+            text = d.page_content.strip().replace("\n", " ")
+            ctx_parts.append(text[:1200])
+        return "\n\n---\n\n".join(ctx_parts), docs
+
+    # 1차 검색
+    context, docs = fetch_ctx(question)
+
+    # 관련성 점검
+    if not context or not grade_relevance(question, context):
+        # 재작성 후 재시도
+        rewritten = rewrite_query(question)
+        context, docs = fetch_ctx(rewritten)
+
+    # 최종 답변
+    answer = generate_answer(question, context)
+
+    # 소스 정리
+    sources = []
+    for d in docs:
+        meta = d.metadata or {}
+        src = meta.get("source") or meta.get("url") or "unknown"
+        snippet = d.page_content.strip().split("\n")
+        snippet = " ".join(snippet)[:300]
+        sources.append({"source": src, "snippet": snippet})
+
+    return answer, sources
+
+
+# =========================
+# 6) 초기 인덱스 빌드
+# =========================
+def build_index() -> Chroma:
+    print("[INFO] Loading documents...")
+    raw_docs = load_docs(CRAWL_URLS)
+    if not raw_docs:
+        print("[WARN] No documents loaded. RAG will likely answer '모르겠습니다.'")
+
+    print(f"[INFO] Loaded {len(raw_docs)} document(s). Splitting...")
+    splits = split_docs(raw_docs)
+
+    print(f"[INFO] Split into {len(splits)} chunks. Building vector store...")
+    vs = build_vectorstore(splits)
+    print("[INFO] Vector store ready.")
+    return vs
+
+
+# =========================
+# 7) Gradio UI
+# =========================
+def make_ui(vectorstore: Chroma):
+    """
+    간단한 Gradio 앱:
+    - 입력: 질문
+    - 출력: 모델 답변 + 출처 테이블
+    """
+    with gr.Blocks(theme=gr.themes.Soft()) as demo:
+        gr.Markdown("## 💬 로컬 DeepSeek-R1 RAG (금융 포털 크롤링)")
+        gr.Markdown(
+            "- 질의를 입력하면 로컬 임베딩 및 LLM(DeepSeek-R1)으로 RAG 답변을 생성합니다.\n"
+            "- 초기 인덱스는 네이버/야후/다음 금융 메인 페이지를 기반으로 합니다."
+        )
+
+        with gr.Row():
+            query = gr.Textbox(
+                label="질문(예: 삼성전자 주가 전망은?)",
+                placeholder="무엇이 궁금하신가요?",
+                lines=2
+            )
+        with gr.Row():
+            btn = gr.Button("질의 실행", variant="primary")
+
+        with gr.Row():
+            answer = gr.Textbox(label="답변", lines=6)
+        sources = gr.Dataframe(
+            headers=["source", "snippet"],
+            datatype=["str", "str"],
+            row_count=(0, "dynamic"),
+            col_count=(2, "fixed"),
+            label="참고한 문서(일부 내용)"
+        )
+
+        def on_submit(q):
+            if not q or not q.strip():
+                return "질문을 입력해주세요.", []
+            ans, srcs = run_rag_pipeline(q.strip(), vectorstore=vectorstore, k=6)
+            rows = [[s["source"], s["snippet"]] for s in srcs]
+            return ans, rows
+
+        btn.click(on_submit, inputs=[query], outputs=[answer, sources])
+        query.submit(on_submit, inputs=[query], outputs=[answer, sources])
+
+    return demo
+
+
+# =========================
+# 8) main
+# =========================
+if __name__ == "__main__":
+    # 인덱스 빌드(앱 시작 시 1회)
+    vs = build_index()
+
+    # Gradio 앱 실행
+    app = make_ui(vs)
+    # share=True는 외부 공유용, 로컬만 원하면 False
+    app.launch(server_name="0.0.0.0", server_port=7860, share=False)
+
+
+

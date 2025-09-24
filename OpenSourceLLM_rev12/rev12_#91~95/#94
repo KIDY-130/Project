@@ -1,0 +1,302 @@
+#94
+# open_agents_app.py
+# -----------------------------------------------------------------------------
+# OpenAI/AutoGen 의존 코드를 "로컬 오픈소스 LLM (Ollama + DeepSeek-R1)"로 변환한 예시
+# - API Key 불필요 (로컬 Ollama REST API 사용)
+# - 모델:
+#     * 채팅/추론: deepseek-r1:7b  (원하면 8b/14b 등으로 교체)
+# - GUI: Gradio (탭 3개: 단일 어시스턴트, 2-에이전트 대화, 마케팅 3-에이전트 파이프라인)
+#
+# 준비:
+#   1) Ollama 설치 후 실행:  ollama serve
+#   2) 모델 다운로드:
+#        ollama pull deepseek-r1:7b
+#   3) 이 파일 실행: python open_agents_app.py
+#   4) 브라우저에서 http://localhost:7860 접속
+# -----------------------------------------------------------------------------
+
+import os
+import re
+import time
+import requests
+import gradio as gr
+
+# -----------------------------
+# 로컬 Ollama 설정
+# -----------------------------
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+LLM_MODEL   = os.environ.get("LLM_MODEL", "deepseek-r1:7b")
+
+# -----------------------------
+# Ollama: /api/generate 래퍼
+# -----------------------------
+def ollama_generate(
+    prompt: str,
+    model: str = LLM_MODEL,
+    system: str | None = None,
+    temperature: float = 0.7,
+    max_tokens: int = 800,
+    stop: list[str] | None = None,
+) -> str:
+    """
+    DeepSeek-R1 등 일반 LLM에 대해 텍스트 생성(비스트리밍) 요청.
+    - OpenAI API Key 불필요.
+    - stop 토큰이 필요하면 리스트로 전달.
+    """
+    url = f"{OLLAMA_HOST}/api/generate"
+    payload = {
+        "model": model,
+        "prompt": prompt if not system else f"<<SYS>>\n{system}\n<</SYS>>\n\n{prompt}",
+        "stream": False,
+        "options": {
+            "temperature": float(temperature),
+            "num_predict": int(max_tokens),
+        },
+    }
+    if stop:
+        payload["stop"] = stop
+
+    try:
+        resp = requests.post(url, json=payload, timeout=120)
+        resp.raise_for_status()
+        text = resp.json().get("response", "")
+        return text.strip()
+    except Exception as e:
+        return f"[오류] Ollama generate 실패: {e}"
+
+# -----------------------------
+# 공통: 시스템/대화 프롬프트 빌더
+# -----------------------------
+def build_dialog_prompt(history: list[tuple[str, str]], next_speaker: str) -> str:
+    """
+    history: [(speaker, content), ...]
+    next_speaker: 다음 발화자의 이름(예: "Assistant" / "Alex(Trainer)" 등)
+    """
+    lines = []
+    for who, msg in history:
+        lines.append(f"{who}: {msg}")
+    lines.append(f"{next_speaker}:")
+    return "\n".join(lines)
+
+# =====================================================================
+# 탭 1) 단일 어시스턴트 (AutoGen의 simple initiate_chat 대체)
+# =====================================================================
+ASSISTANT_SYSTEM = (
+    "당신은 지식이 풍부하고 친절한 조력자입니다. "
+    "사실에 근거하여 명확하고 간결하게 한국어로 답하세요."
+)
+
+def single_assistant_chat(history, user_msg, temperature=0.7, max_tokens=800):
+    """
+    Gradio ChatInterface용 핸들러.
+    - history 형식: [(user, bot), ...]
+    - user_msg: 사용자의 최신 입력
+    """
+    # 대화 이력 -> (발화자, 내용) 리스트로 변환
+    conv = []
+    for u, b in history:
+        if u: conv.append(("User", u))
+        if b: conv.append(("Assistant", b))
+
+    # 사용자 발화 추가
+    conv.append(("User", user_msg))
+
+    # 프롬프트 구성 및 응답 생성
+    prompt = build_dialog_prompt(conv, next_speaker="Assistant")
+    reply = ollama_generate(
+        prompt=prompt,
+        system=ASSISTANT_SYSTEM,
+        temperature=temperature,
+        max_tokens=int(max_tokens),
+        stop=["\nUser:", "\nassistant:", "\nAssistant:"],
+    )
+    return reply
+
+# =====================================================================
+# 탭 2) 2-에이전트 대화 (피트니스 트레이너 ↔ 운동 의학 전문가)
+#       - AutoGen의 ConversableAgent 간 대화 흐름을 로컬에서 모사
+# =====================================================================
+TRAINER_SYS = (
+    "당신의 이름은 Alex이며, 근력/심혈관/유연성 훈련에 전문성을 가진 피트니스 트레이너입니다. "
+    "친절하게, 근거를 간단히 제시하며 한국어로 답하세요."
+)
+DOCTOR_SYS = (
+    "당신의 이름은 Dr. Lee이며, 부상 예방과 재활, 신체 건강 최적화에 특화된 운동 생리학자입니다. "
+    "안전 수칙을 강조하며 한국어로 답하세요."
+)
+
+def two_agent_chat(
+    seed_message="Dr. Lee, 오늘 운동을 시작하려는 사람에게 어떤 운동을 추천할까요?",
+    turns=3,
+    temperature_trainer=0.9,
+    temperature_doctor=0.7,
+    max_tokens=300,
+):
+    """
+    트레이너(Alex)와 닥터(Dr. Lee)가 번갈아가며 대화하는 시뮬레이션.
+    - seed_message: 트레이너가 닥터에게 먼저 보내는 메시지
+    - turns: 총 발화 횟수(왕복 기준이 아니라 '전체 발화 수'로 이해)
+    """
+    # 대화 이력: (화자, 내용)
+    history = [("Alex(Trainer)", seed_message)]
+    speaker = "Dr. Lee"
+
+    for t in range(int(turns) - 1):
+        prompt = build_dialog_prompt(history, next_speaker=speaker)
+        if speaker == "Dr. Lee":
+            reply = ollama_generate(
+                prompt=prompt,
+                system=DOCTOR_SYS,
+                temperature=temperature_doctor,
+                max_tokens=int(max_tokens),
+                stop=["\nAlex(Trainer):", "\nDr. Lee:"],
+            )
+            history.append(("Dr. Lee", reply))
+            speaker = "Alex(Trainer)"
+        else:
+            reply = ollama_generate(
+                prompt=prompt,
+                system=TRAINER_SYS,
+                temperature=temperature_trainer,
+                max_tokens=int(max_tokens),
+                stop=["\nAlex(Trainer):", "\nDr. Lee:"],
+            )
+            history.append(("Alex(Trainer)", reply))
+            speaker = "Dr. Lee"
+
+    # 보기 좋게 포맷팅
+    transcript = []
+    for who, msg in history:
+        transcript.append(f"**{who}**: {msg}")
+    return "\n\n".join(transcript)
+
+# =====================================================================
+# 탭 3) 마케팅 3-에이전트 파이프라인
+#       (시장 조사 → 고객 세분화 → 통합 마케팅 전략)
+# =====================================================================
+RESEARCHER_SYS = (
+    "당신은 전문 시장 조사 전문가입니다. 제품/서비스에 대해 데이터 기반의 "
+    "시장 동향, 경쟁 구도, 타깃 니즈를 간결히 정리하세요. 한국어로 8~12문장."
+)
+SEGMENT_SYS = (
+    "당신은 고객 세분화 전문가입니다. 주어진 시장 조사 결과를 토대로 "
+    "세분 집단(3~5개)을 정의하고, 페르소나/핵심 니즈/접점/메시지를 요약하세요. 한국어."
+)
+STRATEGIST_SYS = (
+    "당신은 마케팅 전략가입니다. 시장 조사와 고객 세분화 결과를 종합하여 "
+    "포지셔닝, 핵심 가치제안, 메시지 프레임, 채널/캠페인 아이디어, KPI를 제시하세요. 한국어."
+)
+
+def generate_marketing_report(product_concept: str, temperature=0.7, max_tokens=700):
+    """
+    세 명의 '가상' 에이전트가 순차로 작업하는 파이프라인.
+    - 각 단계는 로컬 LLM 호출.
+    """
+    product_concept = product_concept.strip()
+    if not product_concept:
+        return ("[경고] 제품 개념을 입력하세요.", "", "")
+
+    # 1) 시장 조사
+    prompt_research = (
+        f"제품 개념: {product_concept}\n\n"
+        "위 제품에 대한 '시장 조사 보고서'를 작성하세요."
+    )
+    market_research = ollama_generate(
+        prompt=prompt_research,
+        system=RESEARCHER_SYS,
+        temperature=temperature,
+        max_tokens=int(max_tokens),
+    )
+
+    # 2) 고객 세분화
+    prompt_seg = (
+        "다음 시장 조사 결과를 바탕으로 고객 세분화 보고서를 작성하세요.\n\n"
+        f"[시장 조사]\n{market_research}"
+    )
+    segmentation = ollama_generate(
+        prompt=prompt_seg,
+        system=SEGMENT_SYS,
+        temperature=temperature,
+        max_tokens=int(max_tokens),
+    )
+
+    # 3) 마케팅 전략
+    prompt_strat = (
+        "다음 정보를 바탕으로 종합적인 마케팅 전략을 수립하세요.\n\n"
+        f"[시장 조사]\n{market_research}\n\n"
+        f"[고객 세분화]\n{segmentation}"
+    )
+    strategy = ollama_generate(
+        prompt=prompt_strat,
+        system=STRATEGIST_SYS,
+        temperature=temperature,
+        max_tokens=int(max_tokens),
+    )
+
+    return (market_research, segmentation, strategy)
+
+# =============================================================================
+# Gradio UI
+# =============================================================================
+with gr.Blocks(title="OpenCode · Local Multi-Agent (Ollama + DeepSeek-R1)", theme=gr.themes.Soft()) as demo:
+    gr.Markdown(
+        """
+        # 🧩 OpenCode · Local Multi-Agent (Ollama + DeepSeek-R1)
+        - OpenAI/autogen 코드 없이 **로컬 Ollama + DeepSeek-R1**로 에이전트/대화 시뮬레이션
+        - API Key 불필요 · 인터넷 연결 불필요(모델만 설치되어 있으면 됨)
+        """
+    )
+
+    # 탭 1) 단일 어시스턴트
+    with gr.Tab("1) 단일 어시스턴트"):
+        gr.Markdown("간단한 Q&A 또는 프롬프트 대화 (AutoGen initiate_chat 대체)")
+        chat = gr.ChatInterface(
+            fn=lambda history, msg, t, m: single_assistant_chat(history, msg, t, m),
+            additional_inputs=[
+                gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Temperature"),
+                gr.Slider(64, 2000, value=800, step=32, label="Max Tokens"),
+            ],
+            title="Assistant",
+            description="친절한 조력자 (한국어)",
+            retry_btn=None, undo_btn=None, clear_btn="대화 초기화"
+        )
+
+    # 탭 2) 2-에이전트 대화
+    with gr.Tab("2) 2-에이전트 대화 (Trainer ↔ Doctor)"):
+        gr.Markdown("피트니스 트레이너와 운동 의학 전문가의 왕복 대화 시뮬레이션")
+        seed = gr.Textbox(label="트레이너의 첫 메시지", value="Dr. Lee, 오늘 운동을 시작하려는 사람에게 어떤 운동을 추천할까요?")
+        turns = gr.Slider(2, 12, value=3, step=1, label="총 발화 수")
+        t_tr = gr.Slider(0.0, 1.0, value=0.9, step=0.05, label="Trainer Temperature")
+        t_dr = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Doctor Temperature")
+        mx = gr.Slider(64, 1000, value=300, step=16, label="각 턴 Max Tokens")
+        btn = gr.Button("대화 실행")
+        out = gr.Markdown()
+        btn.click(
+            two_agent_chat,
+            inputs=[seed, turns, t_tr, t_dr, mx],
+            outputs=[out]
+        )
+
+    # 탭 3) 마케팅 3-에이전트 파이프라인
+    with gr.Tab("3) 마케팅 에이전트 파이프라인"):
+        gr.Markdown("시장 조사 → 고객 세분화 → 마케팅 전략을 순차 생성")
+        prod = gr.Textbox(
+            label="제품 개념",
+            value="AI 기반 개인 맞춤형 건강 관리 웨어러블 디바이스",
+            lines=3
+        )
+        temp = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Temperature")
+        mxt  = gr.Slider(128, 2000, value=700, step=32, label="각 단계 Max Tokens")
+        run3 = gr.Button("보고서 생성")
+        mrk  = gr.Markdown(label="2. 시장 조사")
+        seg  = gr.Markdown(label="3. 고객 세분화")
+        strat= gr.Markdown(label="4. 마케팅 전략")
+        run3.click(
+            generate_marketing_report,
+            inputs=[prod, temp, mxt],
+            outputs=[mrk, seg, strat]
+        )
+
+if __name__ == "__main__":
+    # 0.0.0.0 로 바인딩 → 다른 기기에서도 접속 가능 (동일 네트워크)
+    demo.launch(server_name="0.0.0.0", server_port=7860)

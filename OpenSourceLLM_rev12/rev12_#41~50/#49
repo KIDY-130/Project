@@ -1,0 +1,541 @@
+#49
+# scheduler_app.py
+# ---------------------------------------------
+# 로컬 Ollama(DeepSeek-R1) + Gradio UI 스케줄러 데모
+# - 초기 스케줄의 고정 근무/휴가를 존중하면서 빈 칸을 채워 넣습니다.
+# - 제약:
+#     * 직원별 최소/최대 근무일
+#     * 직원별 최대 연속 근무일
+#     * 하루 필요 인원 수(기본 2명)
+# - 알고리즘:
+#     1) 랜덤 휴리스틱(빠름, 가끔 제약 위반 가능 -> 자동 재시도)
+#     2) 백트래킹(가능하면 완전해, 느릴 수 있음)
+#     3) 유전 알고리즘(근사해, 빠름/안정)
+# - DeepSeek-R1로 결과 해설(옵션)
+# ---------------------------------------------
+
+from __future__ import annotations
+import random
+import itertools
+from typing import List, Optional, Tuple, Dict
+import copy
+import json
+import gradio as gr
+import requests
+
+WORK = "●"      # 근무
+OFF  = "휴가"   # 휴가
+
+# -----------------------------
+# 유틸: 파싱/표현 변환
+# -----------------------------
+def parse_initial_schedule(text: str) -> List[List[Optional[str]]]:
+    """
+    입력 형식(예):
+      ●, , , , , , 
+      , , 휴가, , , 휴가, 
+      ●, , , , , ●, 
+    - 콤마/공백 구분, 줄바꿈으로 행 구분
+    - '●' -> 고정 근무, '휴가' -> 고정 휴가, 빈칸/./None -> 미정(None)
+    """
+    rows = []
+    for line in text.strip().splitlines():
+        if not line.strip():
+            continue
+        tokens = [t.strip() for t in line.split(",")]
+        row = []
+        for t in tokens:
+            if t in ["", ".", "None", "none", "null", "-"]:
+                row.append(None)
+            elif t == WORK:
+                row.append(WORK)
+            elif t == OFF:
+                row.append(OFF)
+            else:
+                # 알 수 없는 토큰은 None으로 처리
+                row.append(None)
+        rows.append(row)
+    # 직사각형 보정(최대 길이에 맞춰 None 패딩)
+    max_len = max(len(r) for r in rows)
+    for r in rows:
+        if len(r) < max_len:
+            r.extend([None]*(max_len - len(r)))
+    return rows
+
+def to_symbols(matrix01: List[List[int]]) -> List[List[str]]:
+    return [[WORK if v == 1 else OFF for v in row] for row in matrix01]
+
+def from_symbols(initial: List[List[Optional[str]]]) -> List[List[Optional[int]]]:
+    """
+    '●' -> 1, '휴가' -> 0, None -> None
+    """
+    out = []
+    for r in initial:
+        row = []
+        for v in r:
+            if v == WORK:
+                row.append(1)
+            elif v == OFF:
+                row.append(0)
+            else:
+                row.append(None)
+        out.append(row)
+    return out
+
+def stringify_schedule(sym: List[List[str]]) -> str:
+    return "\n".join([", ".join(row) for row in sym])
+
+# -----------------------------
+# 제약 검사/통계
+# -----------------------------
+def staff_work_days(sol: List[List[int]], staff: int) -> int:
+    return sum(1 for d in sol[staff] if d == 1)
+
+def consecutive_limit_ok(sol: List[List[int]], staff: int, day: int, max_consec: int) -> bool:
+    """
+    day 위치까지 배정된 상태에서 staff의 연속 근무가 max_consec를 넘는지 검사
+    """
+    cnt = 0
+    for d in range(day, -1, -1):
+        if sol[staff][d] == 1:
+            cnt += 1
+        else:
+            break
+    return cnt <= max_consec
+
+def day_staff_count(sol: List[List[int]], day: int) -> int:
+    return sum(sol[s][day] for s in range(len(sol)))
+
+def is_complete_and_valid(sol: List[List[int]],
+                          min_w: int, max_w: int, max_consec: int,
+                          need_per_day: int) -> bool:
+    S, D = len(sol), len(sol[0])
+    # 직원별 근무일수 제약
+    for s in range(S):
+        w = staff_work_days(sol, s)
+        if not (min_w <= w <= max_w):
+            return False
+        # 연속 근무 검증
+        consec = 0
+        for d in range(D):
+            if sol[s][d] == 1:
+                consec += 1
+                if consec > max_consec:
+                    return False
+            else:
+                consec = 0
+    # 일별 필요 인원
+    for d in range(D):
+        if day_staff_count(sol, d) != need_per_day:
+            return False
+    return True
+
+# -----------------------------
+# 고정 배정 반영
+# -----------------------------
+def apply_fixtures(initial01: List[List[Optional[int]]]) -> List[List[int]]:
+    """
+    초기 스케줄에서 고정값(1 또는 0)을 반영, None은 -1로 채워 배정 전 상태를 표시
+    """
+    sol = []
+    for r in initial01:
+        sol.append([v if v is not None else -1 for v in r])
+    return sol
+
+def is_cell_fixed(initial01: List[List[Optional[int]]], s: int, d: int) -> bool:
+    return initial01[s][d] is not None
+
+# -----------------------------
+# 1) 랜덤 휴리스틱
+# -----------------------------
+def random_construct(initial01: List[List[Optional[int]]],
+                     min_w: int, max_w: int, max_consec: int,
+                     need_per_day: int,
+                     max_trials: int = 2000) -> Optional[List[List[int]]]:
+    """
+    간단한 탐욕+랜덤: 하루 단위로 need_per_day 명을 뽑아 채움.
+    제약 위반 최소화하며 재시도 반복.
+    """
+    S, D = len(initial01), len(initial01[0])
+    for _ in range(max_trials):
+        sol = apply_fixtures(initial01)
+        # 직원별 현재 근무일수 추적
+        workdays = [sum(1 for v in row if v == 1) for row in sol]
+
+        ok = True
+        for d in range(D):
+            # 이미 고정값으로 채워진 인원 카운트
+            fixed_workers = [s for s in range(S) if sol[s][d] == 1]
+            if len(fixed_workers) > need_per_day:
+                ok = False; break
+
+            # 배정 가능한 후보 풀 만들기
+            candidates = []
+            for s in range(S):
+                if sol[s][d] == -1:  # 미정
+                    # 연속 근무 제한 검사(가상으로 1 넣고 확인)
+                    sol[s][d] = 1
+                    if consecutive_limit_ok(sol, s, d, max_consec):
+                        candidates.append(s)
+                    sol[s][d] = -1
+
+            # 필요한 인원수만큼 뽑기(고정 포함)
+            need = need_per_day - len(fixed_workers)
+            if need < 0:
+                ok = False; break
+            if need > len(candidates):
+                # 부족하면 실패로 간주하고 재시도
+                ok = False; break
+
+            # 작업량이 적은 사람 우대(+랜덤 섞기)
+            random.shuffle(candidates)
+            candidates.sort(key=lambda s: workdays[s])
+            pick = candidates[:need]
+
+            # 확정 반영
+            for s in range(S):
+                if sol[s][d] == -1:
+                    sol[s][d] = 1 if s in pick else 0
+
+            # workdays 갱신
+            for s in pick:
+                workdays[s] += 1
+
+            # 일별 충족 확인
+            if day_staff_count(sol, d) != need_per_day:
+                ok = False; break
+
+        if not ok:
+            continue
+
+        # 개인별 최소/최대 근무일 조정(실패 시 재시도)
+        for s in range(S):
+            w = staff_work_days(sol, s)
+            if w < min_w or w > max_w:
+                ok = False; break
+        if not ok:
+            continue
+
+        return sol
+    return None
+
+# -----------------------------
+# 2) 백트래킹(완전 탐색)
+# -----------------------------
+def backtracking(initial01: List[List[Optional[int]]],
+                 min_w: int, max_w: int, max_consec: int,
+                 need_per_day: int,
+                 max_solutions: int = 1) -> List[List[List[int]]]:
+    S, D = len(initial01), len(initial01[0])
+    sol = apply_fixtures(initial01)
+    solutions = []
+
+    # 미정 위치 인덱스 목록(일 단위 조합을 위해 day 별로 처리)
+    days = list(range(D))
+
+    # 사전 고정 검증: 각 날짜 고정 근무자 수가 need_per_day 초과면 불가
+    for d in days:
+        if sum(1 for s in range(S) if initial01[s][d] == 1) > need_per_day:
+            return []
+
+    def dfs(day: int):
+        if len(solutions) >= max_solutions:
+            return
+        if day == D:
+            if is_complete_and_valid(sol, min_w, max_w, max_consec, need_per_day):
+                solutions.append(copy.deepcopy(sol))
+            return
+
+        fixed_yes = [s for s in range(S) if initial01[s][day] == 1]
+        fixed_no  = [s for s in range(S) if initial01[s][day] == 0]
+        remain = need_per_day - len(fixed_yes)
+        if remain < 0:
+            return
+
+        # 후보 = 미정이면서 오늘 배정 가능하고(연속근무 OK) 직원별 max_w 미초과
+        candidates = []
+        for s in range(S):
+            if initial01[s][day] is None:
+                # 임시로 1 넣고 연속근무 검사
+                sol[s][day] = 1
+                cons_ok = consecutive_limit_ok(sol, s, day, max_consec)
+                sol[s][day] = -1
+                if cons_ok and staff_work_days(sol, s) < max_w:
+                    candidates.append(s)
+
+        # 남은 인원 수만큼 조합
+        for pick in itertools.combinations(candidates, remain):
+            # 하루 배정 시도
+            # 1) 고정 YES는 1, pick은 1, 나머지는 0
+            for s in range(S):
+                if initial01[s][day] == 1 or s in pick:
+                    sol[s][day] = 1
+                elif initial01[s][day] == 0:
+                    sol[s][day] = 0
+                else:
+                    sol[s][day] = 0  # 기본 0로 설정
+
+            # 연속근무 위반/부분적 상한 위반 빠른 가지치기
+            bad = False
+            for s in range(S):
+                if not consecutive_limit_ok(sol, s, day, max_consec):
+                    bad = True; break
+                # 남은 날을 모두 쉬어도 min_w를 못 맞출 수 있으면 컷
+                assigned = staff_work_days(sol, s)
+                remaining_days = D - (day + 1)
+                max_possible = assigned + remaining_days
+                if assigned > max_w or max_possible < min_w:
+                    bad = True; break
+            if bad:
+                continue
+
+            dfs(day + 1)
+
+            if len(solutions) >= max_solutions:
+                return
+
+    dfs(0)
+    return solutions
+
+# -----------------------------
+# 3) 유전 알고리즘
+# -----------------------------
+def fitness(sol: List[List[int]],
+           initial01: List[List[Optional[int]]],
+           min_w: int, max_w: int, max_consec: int, need_per_day: int) -> float:
+    S, D = len(sol), len(sol[0])
+    score = 0.0
+
+    # 고정 위반 큰 페널티
+    for s in range(S):
+        for d in range(D):
+            if initial01[s][d] is not None and sol[s][d] != initial01[s][d]:
+                score -= 5.0
+
+    # 일별 필요 인원 편차 페널티
+    for d in range(D):
+        diff = abs(day_staff_count(sol, d) - need_per_day)
+        score -= 2.0 * diff
+
+    # 직원별 근무일 허용 범위에서 보상, 벗어나면 페널티
+    for s in range(S):
+        w = staff_work_days(sol, s)
+        if min_w <= w <= max_w:
+            score += 1.0 * w
+        else:
+            score -= 1.5 * abs((min_w if w < min_w else max_w) - w)
+
+        # 연속근무 위반 페널티
+        consec = 0
+        for d in range(D):
+            if sol[s][d] == 1:
+                consec += 1
+                if consec > max_consec:
+                    score -= 2.5
+            else:
+                consec = 0
+    # 아주 작은 양수 보정(선택 가중치용)
+    return max(score, 0.0001)
+
+def ga_solve(initial01: List[List[Optional[int]]],
+             min_w: int, max_w: int, max_consec: int, need_per_day: int,
+             pop_size: int = 80, generations: int = 150, mutation_rate: float = 0.08,
+             seed: Optional[int] = None) -> List[List[int]]:
+    if seed is not None:
+        random.seed(seed)
+    S, D = len(initial01), len(initial01[0])
+
+    # 초기개체: 고정값은 그대로, 미정은 랜덤(일별 need_per_day 맞추도록 간단 조정)
+    def random_individual():
+        ind = [[(initial01[s][d] if initial01[s][d] is not None else 0) for d in range(D)] for s in range(S)]
+        for d in range(D):
+            fixed_yes = [s for s in range(S) if ind[s][d] == 1]
+            remain = need_per_day - len(fixed_yes)
+            if remain < 0:
+                # 불가능한 초기조건이면, 고정 위반을 최소화하도록 1들을 일부 0으로
+                ones = [s for s in fixed_yes]
+                for s in ones[remain:]:
+                    if initial01[s][d] is None:
+                        ind[s][d] = 0
+            elif remain > 0:
+                pool = [s for s in range(S) if initial01[s][d] is None]
+                pick = random.sample(pool, k=min(remain, len(pool))) if pool else []
+                for s in pick:
+                    ind[s][d] = 1
+        return ind
+
+    population = [random_individual() for _ in range(pop_size)]
+
+    def crossover(p1, p2):
+        # 한 점 교차(직원*일 flatten 인덱스)
+        cut = random.randint(0, S*D - 1)
+        c1 = copy.deepcopy(p1)
+        c2 = copy.deepcopy(p2)
+        for idx in range(cut, S*D):
+            r = idx // D
+            c = idx % D
+            # 고정값은 교차 영향 금지
+            if initial01[r][c] is None:
+                c1[r][c], c2[r][c] = c2[r][c], c1[r][c]
+        return c1, c2
+
+    def mutate(ind):
+        for s in range(S):
+            for d in range(D):
+                if initial01[s][d] is None and random.random() < mutation_rate:
+                    ind[s][d] = 1 - ind[s][d]
+        return ind
+
+    for _ in range(generations):
+        fitnesses = [fitness(ind, initial01, min_w, max_w, max_consec, need_per_day) for ind in population]
+        # 선택(확률비례 샘플링)
+        parents = random.choices(population, weights=fitnesses, k=pop_size)
+        # 교차 + 돌연변이
+        offspring = []
+        for i in range(0, pop_size, 2):
+            p1, p2 = parents[i], parents[(i+1) % pop_size]
+            c1, c2 = crossover(p1, p2)
+            offspring.append(mutate(c1))
+            offspring.append(mutate(c2))
+        population = offspring
+
+    # 최적 개체 반환
+    best = max(population, key=lambda ind: fitness(ind, initial01, min_w, max_w, max_consec, need_per_day))
+    return best
+
+# -----------------------------
+# DeepSeek-R1 해설 (Ollama)
+# -----------------------------
+def deepseek_explain(schedule_sym: List[List[str]], params: Dict, host: str = "http://localhost:11434", model: str = "deepseek-r1") -> str:
+    """
+    Ollama generate API 호출(로컬). 설치 필요: `ollama pull deepseek-r1`
+    """
+    try:
+        prompt = (
+            "다음 근무 스케줄을 한국어로 간결하게 해설하고, 제약(최소/최대 근무일, 최대 연속근무, 일일 필요 인원) 만족 여부를 요약해 주세요.\n"
+            f"파라미터: {json.dumps(params, ensure_ascii=False)}\n"
+            f"스케줄(행=직원, 열=요일):\n{stringify_schedule(schedule_sym)}"
+        )
+        resp = requests.post(
+            f"{host}/api/generate",
+            json={"model": model, "prompt": prompt, "stream": False},
+            timeout=30
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            # Ollama는 {"response": "...", "done": true, ...} 형태
+            return data.get("response", "").strip()
+        else:
+            return f"[DeepSeek-R1 호출 실패] status={resp.status_code}, body={resp.text[:200]}"
+    except Exception as e:
+        return f"[DeepSeek-R1 예외] {e}"
+
+# -----------------------------
+# 메인 실행 함수(Gradio 연동)
+# -----------------------------
+def generate_ui(initial_text: str,
+                algo: str,
+                min_work_days: int,
+                max_work_days: int,
+                max_consec_days: int,
+                need_per_day: int,
+                max_backtrack_solutions: int,
+                ga_pop: int,
+                ga_gen: int,
+                ga_mut: float,
+                use_llm: bool) -> Tuple[str, str]:
+    """
+    반환:
+      - 스케줄(문자열 표)
+      - LLM 해설(옵션)
+    """
+    # 입력 파싱
+    init_sym = parse_initial_schedule(initial_text)
+    if not init_sym:
+        return "초기 스케줄 파싱 실패: 입력을 확인하세요.", ""
+
+    initial01 = from_symbols(init_sym)
+
+    # 파라미터 sanity check
+    S, D = len(initial01), len(initial01[0])
+    # 사전 불가능 검사: 어떤 날 고정 1의 수가 need_per_day 초과면 바로 실패
+    for d in range(D):
+        if sum(1 for s in range(S) if initial01[s][d] == 1) > need_per_day:
+            return f"불가능: {d+1}일차 고정 근무 인원이 필요 인원({need_per_day})을 초과합니다.", ""
+
+    result01 = None
+    if algo == "랜덤(휴리스틱)":
+        result01 = random_construct(initial01, min_work_days, max_work_days, max_consec_days, need_per_day)
+        if result01 is None:
+            return "랜덤 구성으로 유효한 스케줄을 찾지 못했습니다. 파라미터를 조정하거나 다른 알고리즘을 시도하세요.", ""
+    elif algo == "백트래킹(완전 탐색)":
+        sols = backtracking(initial01, min_work_days, max_work_days, max_consec_days, need_per_day, max_solutions=max_backtrack_solutions)
+        if not sols:
+            return "백트래킹으로 해를 찾지 못했습니다. 파라미터를 조정해보세요.", ""
+        result01 = sols[0]
+    else:  # 유전 알고리즘
+        result01 = ga_solve(initial01, min_work_days, max_work_days, max_consec_days, need_per_day,
+                            pop_size=ga_pop, generations=ga_gen, mutation_rate=ga_mut)
+        # GA는 제약 근사이므로, 최종 검증 후 일별 인원/연속제약 등 미충족 시 안내
+        # (엄격히 필요하면 후처리 수선 로직을 추가 가능)
+    result_sym = to_symbols(result01)
+
+    table = stringify_schedule(result_sym)
+
+    explain = ""
+    if use_llm:
+        params = dict(
+            algorithm=algo,
+            min_work_days=min_work_days,
+            max_work_days=max_work_days,
+            max_consecutive_work_days=max_consec_days,
+            need_per_day=need_per_day,
+            staff=len(result01),
+            days=len(result01[0]),
+        )
+        explain = deepseek_explain(result_sym, params)
+
+    return table, explain
+
+# -----------------------------
+# Gradio 앱
+# -----------------------------
+EXAMPLE = """●, , , , , , 
+ , , 휴가, , , 휴가, 
+ ●, , , , , ●, 
+"""
+
+with gr.Blocks(title="OpenCode - 근무 스케줄러 (Ollama + DeepSeek-R1)") as demo:
+    gr.Markdown("## 🗓️ OpenCode 근무 스케줄러\n로컬 **Ollama + DeepSeek-R1**과 **Gradio**로 동작합니다. 초기 스케줄과 제약을 넣고 해를 생성해 보세요.")
+
+    with gr.Row():
+        initial_text = gr.Textbox(label="초기 스케줄(행=직원, 열=요일): 콤마 구분, 빈칸/./None=미정, '●'=고정 근무, '휴가'=고정 휴가", lines=8, value=EXAMPLE)
+        with gr.Column():
+            algo = gr.Radio(choices=["랜덤(휴리스틱)", "백트래킹(완전 탐색)", "유전 알고리즘"], value="랜덤(휴리스틱)", label="알고리즘 선택")
+            min_work_days = gr.Slider(0, 7, value=3, step=1, label="직원별 최소 근무일")
+            max_work_days = gr.Slider(0, 7, value=5, step=1, label="직원별 최대 근무일")
+            max_consec_days = gr.Slider(1, 7, value=5, step=1, label="최대 연속 근무일")
+            need_per_day = gr.Slider(0, 7, value=2, step=1, label="하루 필요 인원 수")
+            use_llm = gr.Checkbox(value=False, label="DeepSeek-R1로 결과 해설 요청")
+
+    with gr.Row():
+        max_backtrack_solutions = gr.Slider(1, 10, value=1, step=1, label="[백트래킹] 찾을 해의 개수(최대)")
+        ga_pop = gr.Slider(10, 300, value=80, step=10, label="[GA] 개체수(population)")
+        ga_gen = gr.Slider(10, 500, value=150, step=10, label="[GA] 세대 수(generations)")
+        ga_mut = gr.Slider(0.0, 0.5, value=0.08, step=0.01, label="[GA] 돌연변이율")
+
+    btn = gr.Button("스케줄 생성")
+
+    out_table = gr.Textbox(label="생성된 스케줄(●=근무 / 휴가)", lines=10)
+    out_explain = gr.Textbox(label="DeepSeek-R1 해설(옵션)", lines=10)
+
+    btn.click(
+        fn=generate_ui,
+        inputs=[initial_text, algo, min_work_days, max_work_days, max_consec_days, need_per_day,
+                max_backtrack_solutions, ga_pop, ga_gen, ga_mut, use_llm],
+        outputs=[out_table, out_explain]
+    )
+
+if __name__ == "__main__":
+    demo.launch()
+

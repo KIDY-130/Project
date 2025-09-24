@@ -1,0 +1,274 @@
+#80
+"""
+Gemini 임베딩 예제(Google Generative AI) ➜ 오픈소스 로컬 임베딩으로 변환
+- 외부 API 키 없이 **로컬**에서 동작
+- 백엔드 2종 지원:
+  1) **Ollama Embeddings** (예: nomic-embed-text, mxbai-embed-large, jina-embeddings 등)
+  2) **FlagEmbedding • BGE-M3** (HF 로컬 가중치)
+- **FAISS** 로 최근접 탐색(NN) 수행
+- **Gradio** GUI 제공(빠른 테스트 / 인덱스 빌드)
+
+원본 기능 대응표
+- 모델 나열(Gemini): Ollama에 설치된 임베딩 모델 이름 입력(또는 bge-m3 로컬)
+- embed_content: ➜ `ollama.embeddings()` 또는 `BGEM3FlagModel.encode()`
+- FAISS 검색: 동일하게 IndexFlat(L2/IP)로 구현
+
+작성: OpenCode
+"""
+
+# ========================
+# 의존 패키지 설치(필요 시)
+# ========================
+try:
+    import ollama
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "ollama"])
+    import ollama
+
+try:
+    from FlagEmbedding import BGEM3FlagModel
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "FlagEmbedding", "peft"])
+    from FlagEmbedding import BGEM3FlagModel
+
+try:
+    import faiss
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "faiss-cpu"])
+    import faiss
+
+try:
+    import gradio as gr
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "gradio>=4.44.0"])  
+    import gradio as gr
+
+import numpy as np
+from typing import List, Tuple, Literal, Optional
+import json, os
+
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+# ========================
+# 1) 임베딩 백엔드: Ollama
+# ========================
+
+def embed_ollama(texts: List[str], model: str = "nomic-embed-text") -> np.ndarray:
+    """
+    Ollama 임베딩 모델 호출.
+    - 사전 준비: `ollama pull nomic-embed-text` (또는 mxbai-embed-large, jina-embeddings 등)
+    - 반환: shape=(N, D) float32 numpy 배열
+    """
+    client = ollama.Client(host=OLLAMA_HOST)
+    vecs: List[List[float]] = []
+    for t in texts:
+        res = client.embeddings(model=model, prompt=t)
+        v = res.get("embedding") or res.get("data", [{}])[0].get("embedding")
+        if v is None:
+            raise RuntimeError("임베딩 결과가 비어있습니다.")
+        vecs.append(v)
+    arr = np.array(vecs, dtype="float32")
+    return arr
+
+# ========================
+# 2) 임베딩 백엔드: BGE-M3 (FlagEmbedding)
+# ========================
+_bge_model: Optional[BGEM3FlagModel] = None
+
+def get_bge() -> BGEM3FlagModel:
+    global _bge_model
+    if _bge_model is None:
+        # 최초 로드 시 로컬 캐시에 모델 다운로드됨
+        _bge_model = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
+    return _bge_model
+
+
+def embed_bge_m3(texts: List[str]) -> np.ndarray:
+    """BGE-M3 로컬 임베딩(dense) 반환."""
+    model = get_bge()
+    out = model.encode(texts)
+    vecs = out["dense_vecs"]  # (N, D)
+    return np.array(vecs, dtype="float32")
+
+# ========================
+# 3) 유틸: 정규화 및 FAISS 검색
+# ========================
+
+def l2_normalize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    nrm = np.linalg.norm(x, axis=1, keepdims=True)
+    return x / np.maximum(nrm, eps)
+
+
+def build_faiss_index(vectors: np.ndarray, metric: Literal["cos", "l2"] = "cos") -> faiss.Index:
+    """
+    metric = "cos": 코사인 유사도 → 벡터 정규화 후 Inner Product(IndexFlatIP)
+    metric = "l2" : 유클리드 거리 → IndexFlatL2
+    """
+    d = vectors.shape[1]
+    if metric == "cos":
+        xb = l2_normalize(vectors.copy())
+        index = faiss.IndexFlatIP(d)
+        index.add(xb)
+        # 정규화된 인덱스 객체와 원본 사이즈 보관을 위해 attribute 부여
+        index.is_cosine = True  # type: ignore
+        return index
+    else:
+        index = faiss.IndexFlatL2(d)
+        index.add(vectors)
+        index.is_cosine = False  # type: ignore
+        return index
+
+
+def search_faiss(index: faiss.Index, query_vecs: np.ndarray, topk: int = 1) -> Tuple[np.ndarray, np.ndarray]:
+    if getattr(index, "is_cosine", False):  # type: ignore
+        q = l2_normalize(query_vecs.copy())
+        sims, ids = index.search(q, topk)
+        return sims, ids
+    else:
+        dists, ids = index.search(query_vecs, topk)
+        return dists, ids
+
+# ========================
+# 4) 데모: 원본 예제와 동일/유사 흐름
+# ========================
+EN_INPUT = ["I'm glad it didn't rain today"]
+EN_TARGETS = [
+    "What is your favorite food?",
+    "Where do you live?",
+    "Morning trains are crowded.",
+    "It's nice weather today.",
+    "The economy is bad lately.",
+]
+
+KO_INPUT = ["오늘은 비가 안와서 다행입니다."]
+KO_TARGETS = [
+    "좋아하는 음식은 무엇인가요?",
+    "어디에 거주하시나요?",
+    "출근시간에 지하철은 매우 붐빕니다.",
+    "오늘 날씨가 참 좋네요.",
+    "최근 경기가 좋지 않습니다.",
+]
+
+# ========================
+# 5) Gradio GUI
+# ========================
+with gr.Blocks(title="OpenCode • 로컬 임베딩 + FAISS", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("""
+    # 🔎 OpenCode • 로컬 임베딩 + FAISS (Ollama / BGE-M3)
+    - 백엔드: **Ollama 임베딩** 또는 **BGE-M3(FlagEmbedding)**
+    - 지표: 코사인/유클리드 선택
+    - 작은 예제로 최근접 문장 찾기
+    """)
+
+    with gr.Tabs():
+        with gr.Tab("Quick Test"):
+            with gr.Row():
+                backend = gr.Radio(["ollama", "bge-m3"], value="ollama", label="백엔드")
+                ollama_model = gr.Textbox(value="nomic-embed-text", label="Ollama 임베딩 모델명")
+                metric = gr.Radio(["cos", "l2"], value="cos", label="유사도/거리")
+                topk = gr.Slider(1, 5, value=1, step=1, label="Top-K")
+            gr.Markdown("**영문 예제** (원본 코드 대응)")
+            en_in = gr.Textbox(value="\n".join(EN_INPUT), label="입력 텍스트(여러 줄)")
+            en_tar = gr.Textbox(value="\n".join(EN_TARGETS), label="타겟 텍스트(한 줄=한 문장)")
+            run_en = gr.Button("영문 예제 실행")
+            out_en = gr.JSON(label="결과")
+
+            def run_example(backend_v, model_v, metric_v, topk_v, q_text, t_text):
+                q_list = [s for s in q_text.splitlines() if s.strip()]
+                t_list = [s for s in t_text.splitlines() if s.strip()]
+                if not t_list:
+                    return {"error": "타겟 텍스트가 비어있습니다."}
+                # 임베딩
+                if backend_v == "ollama":
+                    q_vec = embed_ollama(q_list, model_v)
+                    t_vec = embed_ollama(t_list, model_v)
+                else:
+                    q_vec = embed_bge_m3(q_list)
+                    t_vec = embed_bge_m3(t_list)
+                # 인덱스 + 검색
+                index = build_faiss_index(t_vec, metric_v)
+                scores, ids = search_faiss(index, q_vec, int(topk_v))
+                # 결과 묶기
+                results = []
+                for qi, q in enumerate(q_list):
+                    hits = []
+                    for rank in range(int(topk_v)):
+                        idx = int(ids[qi, rank])
+                        score = float(scores[qi, rank])
+                        hits.append({"rank": rank+1, "text": t_list[idx], "score": score, "index": idx})
+                    results.append({"query": q, "hits": hits})
+                return {"backend": backend_v, "metric": metric_v, "model": (model_v if backend_v=="ollama" else "BAAI/bge-m3"), "results": results}
+
+            run_en.click(run_example, [backend, ollama_model, metric, topk, en_in, en_tar], out_en)
+
+            gr.Markdown("**한글 예제** (원본 코드 대응)")
+            ko_in = gr.Textbox(value="\n".join(KO_INPUT), label="입력 텍스트(여러 줄)")
+            ko_tar = gr.Textbox(value="\n".join(KO_TARGETS), label="타겟 텍스트(한 줄=한 문장)")
+            run_ko = gr.Button("한글 예제 실행")
+            out_ko = gr.JSON(label="결과")
+
+            run_ko.click(run_example, [backend, ollama_model, metric, topk, ko_in, ko_tar], out_ko)
+
+        with gr.Tab("Build Index"):
+            gr.Markdown("일괄 문서로 인덱스를 만들고 쿼리로 검색합니다.")
+            backend2 = gr.Radio(["ollama", "bge-m3"], value="ollama", label="백엔드")
+            ollama_model2 = gr.Textbox(value="nomic-embed-text", label="Ollama 임베딩 모델명")
+            metric2 = gr.Radio(["cos", "l2"], value="cos", label="유사도/거리")
+            docs = gr.Textbox(value="첫 번째 문서\n두 번째 문서\n세 번째 문서", lines=6, label="문서 집합(한 줄=한 문서)")
+            build_btn = gr.Button("인덱스 생성")
+            status = gr.Markdown("상태: 대기중")
+
+            query = gr.Textbox(value="두 번째와 관련된 문장", label="쿼리")
+            topk2 = gr.Slider(1, 10, value=3, step=1, label="Top-K")
+            search_btn = gr.Button("검색")
+            out_search = gr.JSON(label="검색 결과")
+
+            # 세션 상태
+            state_index = gr.State(None)
+            state_docs = gr.State([])
+
+            def do_build(backend_v, model_v, metric_v, docs_text):
+                dlist = [s for s in docs_text.splitlines() if s.strip()]
+                if not dlist:
+                    return None, [], "❌ 문서가 비어있습니다."
+                if backend_v == "ollama":
+                    vecs = embed_ollama(dlist, model_v)
+                else:
+                    vecs = embed_bge_m3(dlist)
+                index = build_faiss_index(vecs, metric_v)
+                return index, dlist, f"✅ 인덱스 생성 완료 • 문서수: {len(dlist)} • 차원: {vecs.shape[1]}"
+
+            def do_search(index, docs_list, q, backend_v, model_v, topk_v):
+                if index is None:
+                    return {"error": "먼저 인덱스를 생성하세요."}
+                if backend_v == "ollama":
+                    qv = embed_ollama([q], model_v)
+                else:
+                    qv = embed_bge_m3([q])
+                scores, ids = search_faiss(index, qv, int(topk_v))
+                hits = []
+                for rank in range(int(topk_v)):
+                    idx = int(ids[0, rank])
+                    score = float(scores[0, rank])
+                    if 0 <= idx < len(docs_list):
+                        hits.append({"rank": rank+1, "doc": docs_list[idx], "score": score, "index": idx})
+                return {"query": q, "hits": hits}
+
+            build_btn.click(do_build, [backend2, ollama_model2, metric2, docs], [state_index, state_docs, status])
+            search_btn.click(do_search, [state_index, state_docs, query, backend2, ollama_model2, topk2], out_search)
+
+    gr.Markdown("""
+    ---
+    ### 사용 팁
+    - Ollama: 먼저 모델을 받아두세요. 예) `ollama pull nomic-embed-text` 또는 `mxbai-embed-large`, `jina-embeddings`
+    - BGE-M3: 첫 로딩 시 HF에서 가중치가 다운로드됩니다.
+    - 코사인 유사도는 임베딩을 L2 정규화하여 Inner Product로 계산합니다.
+    - 언어가 섞여 있어도 멀티링구얼 임베딩(예: BGE-M3, mxbai-embed-large) 사용 시 의미 매핑이 수월합니다.
+    """)
+
+if __name__ == "__main__":
+    demo.launch(server_name="0.0.0.0", server_port=7862, share=False)

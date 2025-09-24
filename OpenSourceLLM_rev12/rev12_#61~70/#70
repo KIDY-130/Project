@@ -1,0 +1,173 @@
+#70
+"""
+OpenCode 변환 규칙 적용 버전
+- Closed LLM(OpenAI) → 오픈소스 LLM(Ollama + DeepSeek-R1)
+- API Key 사용 제거
+- Gradio 그래픽 인터페이스 제공
+- 로컬 PC에 LLM/임베딩 모델이 설치되어 있다는 전제
+
+사전 준비(터미널에서 1회 실행):
+    ollama pull deepseek-r1:latest
+    ollama pull mxbai-embed-large   # 또는 nomic-embed-text 등
+
+필요 패키지(예시):
+    pip install -U langchain langchain-community langchain-ollama faiss-cpu gradio wikipedia arxiv
+
+주의:
+- LangChain 버전에 따라 일부 API가 변경될 수 있습니다(본 코드는 2025 시점 기준 일반적인 구성을 사용).
+- create_openai_tools_agent → ReAct 기반 일반 에이전트로 대체(DeepSeek-R1은 OpenAI식 함수호출 미지원).
+"""
+
+from typing import Tuple
+import gradio as gr
+
+# LangChain 핵심/커뮤니티/OLLAMA 통합
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_community.utilities import ArxivAPIWrapper, WikipediaAPIWrapper
+from langchain_community.tools import ArxivQueryRun, WikipediaQueryRun
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_community.vectorstores import FAISS
+
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.tools.retriever import create_retriever_tool
+
+# 에이전트 구성 요소
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain_core.tools import Tool
+
+# ================================
+# 1) 로컬 오픈소스 LLM/임베딩 설정
+# ================================
+# DeepSeek-R1(추론형) 모델을 Ollama에서 사용합니다.
+llm = ChatOllama(
+    model="deepseek-r1:latest",   # 로컬에 pull된 모델 태그
+    temperature=0.1,               # 일관성 확보를 위한 낮은 온도값
+    num_ctx=8192,                  # 컨텍스트 길이(환경에 맞게 조정)
+)
+
+# 로컬 임베딩 모델(OllamaEmbeddings). 고정밀 임베딩 모델 권장.
+embeddings = OllamaEmbeddings(model="mxbai-embed-large")
+
+# ================================
+# 2) 외부 도구(Wikipedia/Arxiv) 래퍼
+# ================================
+# Wikipedia API 설정 : top_k_results = 결과 수, doc_content_chars_max = 문서 길이 제한
+wiki_api = WikipediaAPIWrapper(top_k_results=1, doc_content_chars_max=200)
+wiki_tool = WikipediaQueryRun(api_wrapper=wiki_api)
+
+# arXiv API 설정
+arxiv_api = ArxivAPIWrapper(top_k_results=1, doc_content_chars_max=200, load_all_available_meta=False)
+arxiv_tool = ArxivQueryRun(api_wrapper=arxiv_api)
+
+# ================================
+# 3) 네이버 뉴스 페이지 크롤링 → 벡터DB 구축(FAISS)
+# ================================
+#   - WebBaseLoader는 단일 URL 크롤링 예시입니다.
+#   - 실제 뉴스 요약/검색 품질을 높이려면 기사 개별 URL 수집 + 다중 로딩을 권장합니다.
+loader = WebBaseLoader("https://news.naver.com/")
+docs = loader.load()  # 웹 문서 로드
+
+# 문서 분할: 1000자 chunk, 200자 중첩
+splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+documents = splitter.split_documents(docs)
+
+# FAISS 벡터DB 생성(오픈소스 임베딩 사용)
+vectordb = FAISS.from_documents(documents, embeddings)
+retriever = vectordb.as_retriever()
+
+# LangChain retriever를 Tool로 래핑
+retriever_tool = create_retriever_tool(
+    retriever,
+    name="naver_news_search",
+    description="네이버 뉴스에서 수집한 로컬 벡터DB. 당일 기사/주요 이슈를 찾고 싶을 때 사용."
+)
+
+# 에이전트가 사용할 도구 모음
+TOOLS = [wiki_tool, arxiv_tool, retriever_tool]
+
+# ================================
+# 4) ReAct 에이전트용 프롬프트
+# ================================
+# OpenAI 함수호출 전용 프롬프트 대신, 일반 ReAct 스타일 프롬프트를 직접 정의합니다.
+react_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     """
+     너는 한국어로 친절하게 답하는 유능한 리서치 에이전트야.
+     너에게는 다음 도구들이 있다: Wikipedia, arXiv, naver_news_search(로컬 벡터DB).
+     질의에 가장 적합한 도구를 선택해 단계적으로 생각하고(필요시), 출처/근거를 요약해줘.
+     불확실하면 정직하게 모른다고 말하고, 과도한 추측은 피하라.
+     최종 답변은 한국어로 제공하라.
+     """
+    ),
+    # 에이전트가 내부적으로 추론/도구 호출을 하다가 마지막에 최종 답만 사용자에게 보여주게 됨.
+    ("human", "{input}"),
+    MessagesPlaceholder("agent_scratchpad"),  # ReAct 체인용 scratchpad
+])
+
+# ReAct 에이전트 구성
+agent = create_react_agent(llm=llm, tools=TOOLS, prompt=react_prompt)
+
+# AgentExecutor: 에이전트와 툴을 실행하는 컨테이너
+agent_executor = AgentExecutor(agent=agent, tools=TOOLS, verbose=True)
+
+# ================================
+# 5) 단일 호출 함수(Gradio에서 사용)
+# ================================
+DEFAULT_QUESTION = "오늘 부동산 관련 주요 소식을 알려줘"
+
+def run_agent(user_input: str) -> Tuple[str, str]:
+    """에이전트를 실행하고 최종 답변과 사용된 도구 힌트를 반환.
+    - 반환값[0]: 최종 답변 텍스트
+    - 반환값[1]: (선택) 부가 정보/디버그 텍스트
+    """
+    if not user_input or not user_input.strip():
+        user_input = DEFAULT_QUESTION
+
+    # AgentExecutor.invoke는 dict 입력/출력을 사용
+    result = agent_executor.invoke({"input": user_input})
+
+    # result 예시: {"input": "...", "output": "최종답변"}
+    final_answer = result.get("output", "")
+
+    # 간단한 디버그/도구 사용 힌트(verboseness가 콘솔에 나오므로 여기서는 최소화)
+    debug_note = "도구: Wikipedia / arXiv / naver_news_search 중 필요시 자동 사용"
+    return final_answer, debug_note
+
+# ================================
+# 6) Gradio UI
+# ================================
+with gr.Blocks(title="OpenCode: LangChain + Ollama Agent") as demo:
+    gr.Markdown("""
+    # 🔎 오픈소스 LLM 기반 뉴스/지식 에이전트
+    - **엔진**: Ollama + DeepSeek-R1 (로컬)
+    - **임베딩**: mxbai-embed-large (로컬)
+    - **도구**: Wikipedia / arXiv / 로컬 FAISS(네이버 뉴스 스냅샷)
+
+    아래 입력창에 한국어로 질문하세요. (예: *오늘 부동산 관련 주요 소식을 알려줘*)
+    """)
+
+    with gr.Row():
+        inp = gr.Textbox(label="질문", value=DEFAULT_QUESTION, lines=2)
+    with gr.Row():
+        btn = gr.Button("🚀 실행", variant="primary")
+    with gr.Row():
+        out_answer = gr.Markdown(label="에이전트 응답")
+    with gr.Accordion("세부 정보(간단)", open=False):
+        out_debug = gr.Markdown()
+
+    def _on_click(q):
+        answer, dbg = run_agent(q)
+        return answer, dbg
+
+    btn.click(_on_click, inputs=[inp], outputs=[out_answer, out_debug])
+
+# 엔트리 포인트
+if __name__ == "__main__":
+    # local URL 출력, 공유 공개 X
+    demo.launch()
+
+
+# ollama pull deepseek-r1:latest
+# ollama pull mxbai-embed-large
+# !pip install -U langchain langchain-community langchain-ollama faiss-cpu gradio # wikipedia arxiv
